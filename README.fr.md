@@ -25,6 +25,16 @@ WireShade résout les défis complexes d'implémentation réseau avec une soluti
 *   **🔄 Reconnexion Automatique :** Logique intégrée pour gérer les pertes de connexion et les changements de réseau de manière transparente.
 *   **⚡ Haute Performance :** Propulsé par Rust et NAPI-RS pour des performances quasi-natives.
 
+## ✅ Plates-formes supportées
+
+| Plate-forme | Architecture | Statut |
+| :--- | :--- | :--- |
+| **Windows** | x64 | ✅ |
+| **macOS** | Intel & Apple Silicon | ✅ |
+| **Linux** | x64, ARM64 | ✅ |
+| **Raspberry Pi** | ARMv7 | ✅ |
+| **Docker** | Alpine, Debian | ✅ |
+
 ## 📦 Installation
 
 ```bash

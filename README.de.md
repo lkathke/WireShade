@@ -40,6 +40,16 @@ Diese Architektur bedeutet:
 - **Kein Konflikt** mit bestehenden VPNs oder Systemnetzwerken.
 - **Plattformunabhängige** Kompatibilität (Windows, macOS, Linux, **Raspberry Pi**, Docker Container) ohne Kernel-Module.
 
+## ✅ Unterstützte Plattformen
+
+| Plattform | Architektur | Status |
+| :--- | :--- | :--- |
+| **Windows** | x64 | ✅ |
+| **macOS** | Intel & Apple Silicon | ✅ |
+| **Linux** | x64, ARM64 | ✅ |
+| **Raspberry Pi** | ARMv7 | ✅ |
+| **Docker** | Alpine, Debian | ✅ |
+
 ## 📦 Installation
 
 ```bash

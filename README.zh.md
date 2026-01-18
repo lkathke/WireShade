@@ -25,6 +25,16 @@ WireShade 以干净的原生用户态解决方案解决了复杂的网络实现�
 *   **🔄 自动重连：** 内置逻辑，可无缝处理连接断开和网络更改。
 *   **⚡ 高性能：** 由 Rust 和 NAPI-RS 提供支持，具有近乎原生的性能。
 
+## ✅ 支持的平台
+
+| 平台 | 架构 | 状态 |
+| :--- | :--- | :--- |
+| **Windows** | x64 | ✅ |
+| **macOS** | Intel & Apple Silicon | ✅ |
+| **Linux** | x64, ARM64 | ✅ |
+| **Raspberry Pi** | ARMv7 | ✅ |
+| **Docker** | Alpine, Debian | ✅ |
+
 ## 📦 安装
 
 ```bash

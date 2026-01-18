@@ -40,6 +40,16 @@ This architecture means:
 - **No conflict** with existing VPNs or system networking.
 - **Cross-platform** compatibility (Windows, macOS, Linux, **Raspberry Pi**, Docker containers) without kernel modules.
 
+## ✅ Supported Platforms
+
+| Platform | Architecture | Status |
+| :--- | :--- | :--- |
+| **Windows** | x64 | ✅ |
+| **macOS** | Intel & Apple Silicon | ✅ |
+| **Linux** | x64, ARM64 | ✅ |
+| **Raspberry Pi** | ARMv7 | ✅ |
+| **Docker** | Alpine, Debian | ✅ |
+
 ## 📦 Installation
 
 ```bash
