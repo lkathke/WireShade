@@ -1,0 +1,27 @@
+[package]
+name = "wireshade"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2.12", features = ["tokio_rt", "async"] }
+napi-derive = "2.12"
+# Core networking
+tokio = { version = "1", features = ["full"] }
+# The userspace TCP/IP stack
+smoltcp = { version = "0.12", features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "async"] }
+# WireGuard implementation (Cloudflare)
+boringtun = "0.6"
+# Utilities
+bytes = "1"
+thiserror = "1"
+hex = "0.4"
+base64 = "0.21"
+log = "0.4"
+env_logger = "0.10"
+
+[build-dependencies]
+napi-build = "2.0"

@@ -1,0 +1,31 @@
+{
+  "name": "wireshade",
+  "version": "1.0.0",
+  "main": "index.js",
+  "napi": {
+    "binaryName": "wireshade",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "armv7-unknown-linux-gnueabihf"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "description": "",
+  "devDependencies": {
+    "@napi-rs/cli": "^3.5.1"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
