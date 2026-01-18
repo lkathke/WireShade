@@ -34,9 +34,7 @@
   "license": "MIT",
   "description": "",
   "devDependencies": {
-    "@napi-rs/cli": "^3.5.1"
-  },
-  "dependencies": {
+    "@napi-rs/cli": "^3.5.1",
     "express": "^5.2.1"
   }
 }
