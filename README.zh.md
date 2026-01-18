@@ -3,6 +3,7 @@
 **Node.js 终极用户态 WireGuard® 实现**
 
 [![npm version](https://img.shields.io/npm/v/wireshade.svg)](https://www.npmjs.com/package/wireshade)
+[![npm downloads](https://img.shields.io/npm/dm/wireshade.svg)](https://www.npmjs.com/package/wireshade)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **WireShade** 使您的 Node.js 应用程序能够直接连接到 WireGuard VPN，而**无需 root 权限**、内核模块或修改系统网络设置。它使用直接集成到 Node.js 中的自定义 Rust TCP/IP 栈（`smoltcp`）完全在用户态运行。

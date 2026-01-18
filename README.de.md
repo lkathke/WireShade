@@ -3,6 +3,7 @@
 **Die ultimative Userspace WireGuard® Implementierung für Node.js**
 
 [![npm version](https://img.shields.io/npm/v/wireshade.svg)](https://www.npmjs.com/package/wireshade)
+[![npm downloads](https://img.shields.io/npm/dm/wireshade.svg)](https://www.npmjs.com/package/wireshade)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **WireShade** ermöglicht es deiner Node.js-Anwendung, sich direkt mit einem WireGuard-VPN zu verbinden – **ohne Root-Rechte**, Kernel-Module oder Änderungen an den Systemeinstellungen. Es läuft vollständig im Userspace unter Verwendung eines benutzerdefinierten Rust-basierten TCP/IP-Stacks (`smoltcp`), der direkt in Node.js integriert ist.
