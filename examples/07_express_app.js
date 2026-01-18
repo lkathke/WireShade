@@ -1,5 +1,5 @@
 const express = require('express');
-const { WireShade } = require('../index');
+const { WireShade } = require('wireshade');
 const http = require('http');
 const path = require('path');
 

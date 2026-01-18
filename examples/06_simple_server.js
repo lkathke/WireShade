@@ -1,4 +1,4 @@
-const { WireShade } = require('../index');
+const { WireShade } = require('wireshade');
 const path = require('path');
 
 /**

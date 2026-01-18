@@ -4,10 +4,10 @@
  * Zeigt die automatische Reconnection-Logik mit Events und Konfiguration.
  */
 
-const { WireShade, ConnectionState } = require('../index');
+const { WireShade, ConnectionState } = require('wireshade');
 const https = require('https');
 
-const { readWireGuardConfig } = require('../lib/config_parser');
+const { readWireGuardConfig } = require('wireshade');
 const path = require('path');
 
 const wireguardConfig = readWireGuardConfig(path.join(__dirname, 'wireguard.conf'));
