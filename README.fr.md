@@ -45,6 +45,8 @@ await client.start();
 ### 1. Requêtes HTTP/HTTPS (Client)
 Utilisez WireShade comme un agent transparent pour vos requêtes.
 
+> **Note sur le DNS :** Vous pouvez mapper des noms d'hôtes personnalisés comme `internal.service` directement à des adresses IP dans la configuration `hosts`. WireShade résoudra automatiquement ces noms lors de la requête.
+
 **Module natif `http`/`https` :**
 ```javascript
 const https = require('https');

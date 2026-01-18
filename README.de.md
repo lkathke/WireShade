@@ -60,11 +60,15 @@ await client.start();
 ### 1. HTTP/HTTPS Requests (Client)
 Nutze WireShade als transparenten Agent für deine Requests.
 
+> **Hinweis zu DNS:** Du kannst eigene Hostnamen wie `internal.service` direkt in der `hosts`-Konfiguration auf IP-Adressen mappen. WireShade löst diese Namen dann automatisch während des Requests auf.
+
 **Vereinfachte API:**
 ```javascript
 const html = await client.get('https://internal.service/api');
 console.log(html);
 ```
+
+> **Hinweis zu DNS:** Du kannst eigene Hostnamen wie `internal.service` direkt in der `hosts`-Konfiguration auf IP-Adressen mappen. WireShade löst diese Namen dann automatisch während des Requests auf.
 
 **Natives `http`/`https` Modul:**
 ```javascript

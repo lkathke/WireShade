@@ -45,6 +45,8 @@ await client.start();
 ### 1. HTTP/HTTPS请求 (客户端)
 使用 WireShade 作为请求的透明代理。
 
+> **关于 DNS 的说明：** 您可以在 `hosts` 配置中将 `internal.service` 等自定义主机名直接映射到 IP 地址。WireShade 将在请求期间自动拦截并解析这些名称。
+
 **原生 `http`/`https` 模块：**
 ```javascript
 const https = require('https');

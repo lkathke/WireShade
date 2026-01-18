@@ -68,6 +68,8 @@ const html = await client.get('https://internal.service/api');
 console.log(html);
 ```
 
+> **Note on DNS:** You can map custom hostnames like `internal.service` directly to IP addresses in the `hosts` configuration. WireShade will automatically intercept and resolve these names during the request.
+
 **Native `http`/`https` Module:**
 ```javascript
 const https = require('https');
