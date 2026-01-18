@@ -39,6 +39,7 @@ async function exampleHttp() {
             process.exit(1);
         });
     });
+    gw.start().catch(console.error);
 }
 
 exampleHttp();

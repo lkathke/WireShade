@@ -41,7 +41,10 @@ async function exampleHttps() {
             console.error("HTTPS Request Failed:", err);
             process.exit(1);
         });
+
     });
+
+    gw.start().catch(console.error);
 }
 
 exampleHttps();

@@ -18,7 +18,7 @@ async function main() {
     // Create standard HTTP server (but don't listen on TCP port)
     const httpServer = http.createServer(app);
 
-    // 2. Setup GhostWire
+    // 2. Setup WireShade
     const gw = new WireShade(path.join(__dirname, 'wireguard.conf'));
 
     gw.on('connect', async () => {
@@ -32,6 +32,8 @@ async function main() {
 
         console.log("✅ Express Server accessible at http://10.0.0.2:8080");
     });
+
+    gw.start().catch(console.error);
 }
 
 main();

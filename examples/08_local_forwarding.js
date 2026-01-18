@@ -25,6 +25,8 @@ async function examplePortForward() {
             console.error("Failed to start forwarding:", err.message);
         }
     });
+
+    gw.start().catch(console.error);
 }
 
 examplePortForward();

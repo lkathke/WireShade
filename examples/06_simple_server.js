@@ -35,6 +35,8 @@ async function main() {
     });
 
     gw.on('error', console.error);
+
+    gw.start().catch(console.error);
 }
 
 main();

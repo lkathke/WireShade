@@ -78,6 +78,9 @@ async function main() {
         console.log('[Health] 💓 Health check...');
     });
 
+    // Start connection
+    client.start().catch(console.error);
+
     // Wait for initial connection
     await new Promise(resolve => setTimeout(resolve, 4000));
 

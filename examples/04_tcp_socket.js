@@ -45,6 +45,8 @@ async function exampleTcp() {
             console.error("Socket error:", err.message);
         });
     });
+
+    gw.start().catch(console.error);
 }
 
 exampleTcp();

@@ -28,6 +28,8 @@ async function exampleInternet() {
             process.exit(1);
         });
     });
+
+    gw.start().catch(console.error);
 }
 
 exampleInternet();

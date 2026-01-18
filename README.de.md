@@ -184,7 +184,7 @@ console.log('VPN-Nutzer können deinen Server unter http://<VPN-IP>:8080 erreich
 WireShade enthält robuste Logik für Reconnects.
 
 ```javascript
-const client = new WireShadeClient({
+const client = new WireShade({
     wireguard: { ... },
     reconnect: {
         enabled: true,
@@ -201,7 +201,7 @@ client.on('reconnecting', (attempt) => console.log(`🔄 Verbinde neu... (${atte
 Mappe interne VPN-Hostnamen auf IP-Adressen, ohne `/etc/hosts` anzufassen.
 
 ```javascript
-const client = new WireShadeClient({
+const client = new WireShade({
     wireguard: { ... },
     hosts: {
         'intern-api.local': '10.0.0.4',
@@ -212,7 +212,7 @@ const client = new WireShadeClient({
 
 ## 📚 API Referenz
 
-**`new WireShadeClient(config)`**
+**`new WireShade(config)`**
 - Erstellt eine neue VPN-Instanz. `config` entspricht den Standard-WireGuard-Parametern (`privateKey`, `endpoint`, etc.).
 
 **`client.start()`**

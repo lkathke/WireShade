@@ -1,6 +1,6 @@
 {
   "name": "wireshade",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "main": "index.js",
   "napi": {
     "binaryName": "wireshade",
