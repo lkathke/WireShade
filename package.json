@@ -36,5 +36,9 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",
     "express": "^5.2.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lkathke/WireShade.git"
   }
 }
