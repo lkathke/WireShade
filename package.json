@@ -1,6 +1,6 @@
 {
   "name": "wireshade",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "main": "index.js",
   "types": "index.d.ts",
   "exports": {
@@ -26,8 +26,8 @@
     ]
   },
   "scripts": {
-    "build": "set PATH=%PATH%;C:\\Users\\lkathke\\.cargo\\bin&&napi build --platform --release",
-    "build:debug": "set PATH=%PATH%;C:\\Users\\lkathke\\.cargo\\bin&&napi build --platform",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
     "test": "node test.js"
   },
   "keywords": [],
