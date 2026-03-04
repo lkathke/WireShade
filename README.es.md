@@ -48,8 +48,8 @@ npm install wireshade
 
 Todos los ejemplos asumen que has inicializado el cliente:
 ```javascript
-const { WireShade, readConfig } = require('wireshade');
-const client = new WireShade(readConfig('./wg0.conf'));
+const { WireShade } = require('wireshade');
+const client = new WireShade('./wg0.conf');
 await client.start();
 ```
 
@@ -77,7 +77,44 @@ const response = await axios.get('https://internal.service/api', {
 });
 ```
 
-### 2. TCP y WebSockets a VPN (Cliente)
+### 2. Pruebas Locales de VPN P2P
+Puedes ejecutar dos instancias de WireShade localmente para establecer un túnel VPN P2P para pruebas, conectándolas directamente a través de puertos UDP locales.
+
+```javascript
+const { WireShade, generateKeyPair } = require('wireshade');
+
+const keyA = generateKeyPair();
+const keyB = generateKeyPair();
+
+const clientA = new WireShade({
+    wireguard: {
+        privateKey: keyA.privateKey,
+        peerPublicKey: keyB.publicKey,
+        endpoint: '127.0.0.1:51821', // Apunta al puerto de escucha de B
+        sourceIp: '10.0.0.1',
+        listenPort: 51820 // Escucha en este puerto
+    }
+});
+
+const clientB = new WireShade({
+    wireguard: {
+        privateKey: keyB.privateKey,
+        peerPublicKey: keyA.publicKey,
+        endpoint: '127.0.0.1:51820', // Apunta al puerto de escucha de A
+        sourceIp: '10.0.0.2',
+        listenPort: 51821 // Escucha en este puerto
+    }
+});
+
+await clientA.start();
+await clientB.start();
+
+// Ping de A a B
+const pingTime = await clientA.ping('10.0.0.2');
+console.log(`Ping exitoso: ${pingTime}ms`);
+```
+
+### 3. TCP y WebSockets a VPN (Cliente)
 Conéctate a servicios TCP sin procesar o WebSockets que se ejecutan dentro de la VPN.
 
 **WebSockets:**

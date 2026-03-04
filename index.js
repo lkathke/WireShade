@@ -16,6 +16,7 @@ const { WireShadeAgent } = require('./lib/agent');
 const { WireShadeClient, ConnectionState } = require('./lib/client');
 const { WireShadeServer } = require('./lib/server');
 const { parseWireGuardConfig, readWireGuardConfig } = require('./lib/config_parser');
+const { generateKeyPair } = require('./lib/crypto_utils');
 
 module.exports = {
     WireShade: WireShadeClient, // The high-level client is the main export
@@ -25,5 +26,6 @@ module.exports = {
     WireShadeServer,
     ConnectionState,
     parseConfig: parseWireGuardConfig,
-    readConfig: readWireGuardConfig
+    readConfig: readWireGuardConfig,
+    generateKeyPair
 };

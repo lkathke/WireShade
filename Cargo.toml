@@ -12,7 +12,7 @@ napi-derive = "2.12"
 # Core networking
 tokio = { version = "1", features = ["full"] }
 # The userspace TCP/IP stack
-smoltcp = { version = "0.12", features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "async"] }
+smoltcp = { version = "0.12", features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-icmp", "async"] }
 # WireGuard implementation (Cloudflare)
 boringtun = "0.6"
 # Utilities

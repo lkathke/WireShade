@@ -45,6 +45,10 @@ enum NetworkCommand {
         on_close: ThreadsafeFunction<u32>, // (conn_id)
         resp: oneshot::Sender<Result<()>>,
     },
+    Ping {
+        dest_ip: Ipv4Address,
+        resp: oneshot::Sender<Result<u32>>,
+    },
 }
 
 // Struct to store listener callback info
@@ -164,6 +168,7 @@ impl WireShade {
         preshared_key: Option<String>,
         endpoint: String,
         source_ip: String,
+        listen_port: Option<u16>,
     ) -> Result<Self> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
 
@@ -192,7 +197,8 @@ impl WireShade {
                 None 
             ).expect("Failed to create Tunn");
 
-            let udp_socket = UdpSocket::bind("0.0.0.0:0").await.expect("Failed to bind UDP");
+            let bind_addr = format!("0.0.0.0:{}", listen_port.unwrap_or(0));
+            let udp_socket = UdpSocket::bind(&bind_addr).await.expect("Failed to bind UDP");
             let local_addr = udp_socket.local_addr().expect("Failed to get local addr");
             udp_socket.connect(endpoint_addr).await.expect("Failed to connect UDP");
             eprintln!("UDP bound to {} and connected to {}", local_addr, endpoint_addr);
@@ -217,6 +223,20 @@ impl WireShade {
             // NO routes - exactly like river
             eprintln!("Interface configured: {}/32 (exactly like river)", source_ip_addr);
             let _ = std::io::stderr().flush();
+
+            let icmp_rx_buffer = smoltcp::socket::icmp::PacketBuffer::new(
+                vec![smoltcp::socket::icmp::PacketMetadata::EMPTY; 16],
+                vec![0; 1024]
+            );
+            let icmp_tx_buffer = smoltcp::socket::icmp::PacketBuffer::new(
+                vec![smoltcp::socket::icmp::PacketMetadata::EMPTY; 16],
+                vec![0; 1024]
+            );
+            let mut icmp_socket = smoltcp::socket::icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
+            icmp_socket.bind(smoltcp::socket::icmp::Endpoint::Ident(0x1234)).expect("failed to bind ICMP");
+            let icmp_handle = socket_set.add(icmp_socket);
+            let mut pending_pings: HashMap<u16, (oneshot::Sender<Result<u32>>, std::time::Instant)> = HashMap::new();
+            let mut ping_seq = 1u16;
 
             let mut connections: HashMap<u32, (smoltcp::iface::SocketHandle, ConnectionContext)> = HashMap::new();
             let mut listeners: HashMap<u16, ListenerInfo> = HashMap::new();
@@ -474,6 +494,54 @@ impl WireShade {
                                         }
                                     }
                                 }
+                                NetworkCommand::Ping { dest_ip, resp } => {
+                                    eprintln!("[PING] Request to {}", dest_ip);
+                                    let socket = socket_set.get_mut::<smoltcp::socket::icmp::Socket>(icmp_handle);
+                                    
+                                    let seq = ping_seq;
+                                    ping_seq = ping_seq.wrapping_add(1);
+                                    
+                                    let mut packet = vec![0u8; 8 + 4]; // 8 bytes header + 4 bytes payload
+                                    packet[0] = 8; // Type: Echo Request
+                                    packet[1] = 0; // Code: 0
+                                    packet[4] = 0x12; // Ident high
+                                    packet[5] = 0x34; // Ident low
+                                    packet[6] = (seq >> 8) as u8;
+                                    packet[7] = (seq & 0xff) as u8;
+                                    packet[8..12].copy_from_slice(b"PING");
+
+                                    // Calculate checksum
+                                    let mut sum = 0u32;
+                                    for chunk in packet.chunks(2) {
+                                        let word = if chunk.len() == 2 {
+                                            ((chunk[0] as u32) << 8) | (chunk[1] as u32)
+                                        } else {
+                                            (chunk[0] as u32) << 8
+                                        };
+                                        sum = sum.wrapping_add(word);
+                                    }
+                                    while (sum >> 16) > 0 {
+                                        sum = (sum & 0xffff) + (sum >> 16);
+                                    }
+                                    let csum = !sum as u16;
+                                    packet[2] = (csum >> 8) as u8;
+                                    packet[3] = (csum & 0xff) as u8;
+
+                                    if socket.can_send() {
+                                        match socket.send(packet.len(), IpAddress::Ipv4(dest_ip)) {
+                                            Ok(buf) => {
+                                                buf.copy_from_slice(&packet);
+                                                pending_pings.insert(seq, (resp, std::time::Instant::now()));
+                                            }
+                                            Err(e) => {
+                                                let _ = resp.send(Err(Error::from_reason(format!("ICMP send failed: {:?}", e))));
+                                            }
+                                        }
+                                        iface.poll(Instant::now(), &mut device, &mut socket_set);
+                                    } else {
+                                        let _ = resp.send(Err(Error::from_reason("ICMP socket cannot send")));
+                                    }
+                                }
                              }
                         }
                     }
@@ -662,6 +730,33 @@ impl WireShade {
                     }
                 }
 
+                // Process ICMP Responses
+                let icmp_socket = socket_set.get_mut::<smoltcp::socket::icmp::Socket>(icmp_handle);
+                if icmp_socket.can_recv() {
+                    let mut data = vec![0; 1024];
+                    if let Ok((len, _)) = icmp_socket.recv_slice(&mut data) {
+                        if len >= 8 && data[0] == 0 { // Echo Reply (0)
+                            let seq = ((data[6] as u16) << 8) | (data[7] as u16);
+                            if let Some((resp, start_time)) = pending_pings.remove(&seq) {
+                                let elapsed = start_time.elapsed().as_millis() as u32;
+                                let _ = resp.send(Ok(elapsed));
+                            }
+                        }
+                    }
+                }
+
+                let mut expired_pings = Vec::new();
+                for (seq, (_, start_time)) in pending_pings.iter() {
+                    if start_time.elapsed().as_secs() > 2 { // 2 second timeout
+                        expired_pings.push(*seq);
+                    }
+                }
+                for seq in expired_pings {
+                    if let Some((resp, _)) = pending_pings.remove(&seq) {
+                        let _ = resp.send(Err(Error::from_reason("Ping timeout")));
+                    }
+                }
+
                 // Check if any connections can now send pending buffered data
                 for (id, (handle, _)) in connections.iter() {
                     let socket = socket_set.get_mut::<tcp::Socket>(*handle);
@@ -721,6 +816,9 @@ impl WireShade {
                                                 if let Ok(_) = socket.listen(local_endpoint) {
                                                     let new_handle = socket_set.add(socket);
                                                     listening_sockets.insert(port, new_handle); // Replace occupied handle
+                                                } else {
+                                                    eprintln!("[SERVER] Failed to create replacement listener socket for port {}", port);
+                                                    listening_sockets.remove(&port); // IMPORTANT: remove old handle to prevent infinite loop
                                                 }
                                             }
                                         }
@@ -800,6 +898,23 @@ impl WireShade {
             connection_id
         }).await.map_err(|_| Error::from_reason("Failed to close connection"))?;
         Ok(())
+    }
+
+    /// Ping an IP via ICMP
+    #[napi]
+    pub async fn ping(&self, dest_ip: String) -> Result<u32> {
+        let dest_ip_addr = Ipv4Address::from_str(&dest_ip).map_err(|_| Error::from_reason("Invalid dest IP"))?;
+        
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(NetworkCommand::Ping { 
+            dest_ip: dest_ip_addr, 
+            resp: tx 
+        }).await.map_err(|_| Error::from_reason("Failed to send Ping command"))?;
+
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(Error::from_reason("Ping Task Failed")),
+        }
     }
 }
 
