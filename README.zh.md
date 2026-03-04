@@ -48,8 +48,8 @@ npm install wireshade
 
 所有示例均假设您已初始化客户端：
 ```javascript
-const { WireShade, readConfig } = require('wireshade');
-const client = new WireShade(readConfig('./wg0.conf'));
+const { WireShade } = require('wireshade');
+const client = new WireShade('./wg0.conf');
 await client.start();
 ```
 
@@ -77,7 +77,44 @@ const response = await axios.get('https://internal.service/api', {
 });
 ```
 
-### 2. TCP & WebSockets 到 VPN (客户端)
+### 2. 本地 P2P VPN 测试
+您可以在本地运行两个 WireShade 实例，建立用于测试的 P2P VPN 隧道，它们将通过本地 UDP 端口直接连接。
+
+```javascript
+const { WireShade, generateKeyPair } = require('wireshade');
+
+const keyA = generateKeyPair();
+const keyB = generateKeyPair();
+
+const clientA = new WireShade({
+    wireguard: {
+        privateKey: keyA.privateKey,
+        peerPublicKey: keyB.publicKey,
+        endpoint: '127.0.0.1:51821', // 指向 B 的侦听端口
+        sourceIp: '10.0.0.1',
+        listenPort: 51820 // 在此端口上侦听
+    }
+});
+
+const clientB = new WireShade({
+    wireguard: {
+        privateKey: keyB.privateKey,
+        peerPublicKey: keyA.publicKey,
+        endpoint: '127.0.0.1:51820', // 指向 A 的侦听端口
+        sourceIp: '10.0.0.2',
+        listenPort: 51821 // 在此端口上侦听
+    }
+});
+
+await clientA.start();
+await clientB.start();
+
+// 从 A ping B
+const pingTime = await clientA.ping('10.0.0.2');
+console.log(`Ping successful: ${pingTime}ms`);
+```
+
+### 3. TCP & WebSockets 到 VPN (客户端)
 连接到 VPN 内部运行的原始 TCP 服务或 WebSocket。
 
 **WebSockets：**

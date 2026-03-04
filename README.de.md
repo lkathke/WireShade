@@ -63,8 +63,8 @@ npm install wireshade
 
 Alle Beispiele gehen davon aus, dass der Client initialisiert ist:
 ```javascript
-const { WireShade, readConfig } = require('wireshade');
-const client = new WireShade(readConfig('./wg0.conf'));
+const { WireShade } = require('wireshade');
+const client = new WireShade('./wg0.conf');
 await client.start();
 ```
 
@@ -114,7 +114,44 @@ const response = await fetch('https://internal.service/api', {
 });
 ```
 
-### 2. TCP & WebSockets ins VPN (Client)
+### 2. Lokales P2P VPN Testing
+Man kann auch zwei WireShade Instanzen lokal erstellen, um einen eigenen kleinen P2P VPN Tunnel aufzubauen, in dem sich beide Peers direkt über lokale UDP-Ports verbinden. Das ist ideal fürs Testen.
+
+```javascript
+const { WireShade, generateKeyPair } = require('wireshade');
+
+const keyA = generateKeyPair();
+const keyB = generateKeyPair();
+
+const clientA = new WireShade({
+    wireguard: {
+        privateKey: keyA.privateKey,
+        peerPublicKey: keyB.publicKey,
+        endpoint: '127.0.0.1:51821', // Zeigt auf den Listen-Port von B
+        sourceIp: '10.0.0.1',
+        listenPort: 51820 // Lauscht auf diesem Port
+    }
+});
+
+const clientB = new WireShade({
+    wireguard: {
+        privateKey: keyB.privateKey,
+        peerPublicKey: keyA.publicKey,
+        endpoint: '127.0.0.1:51820', // Zeigt auf den Listen-Port von A
+        sourceIp: '10.0.0.2',
+        listenPort: 51821 // Lauscht auf diesem Port
+    }
+});
+
+await clientA.start();
+await clientB.start();
+
+// Ping von A nach B
+const pingTime = await clientA.ping('10.0.0.2');
+console.log(`Ping erfolgreich: ${pingTime}ms`);
+```
+
+### 3. TCP & WebSockets ins VPN (Client)
 Verbinde dich zu reinen TCP-Diensten oder WebSockets, die im VPN laufen.
 
 **Raw TCP:**
@@ -250,6 +287,9 @@ const client = new WireShade({
 
 **`client.getHttpAgent() / client.getHttpsAgent()`**
 - Gibt einen Node.js `http.Agent` / `https.Agent` zurück, der so konfiguriert ist, dass er Traffic durch den Tunnel leitet.
+
+**`client.ping(ip)`**
+- Pingt einen entfernten Host via ICMP an und gibt ein `Promise` mit der Latenzzeit in Millisekunden zurück.
 
 ---
 

@@ -65,8 +65,8 @@ _Note: Windows users need basic build tools (Visual Studio Build Tools) if prebu
 
 All examples assume you have initialized the client:
 ```javascript
-const { WireShade, readConfig } = require('wireshade');
-const client = new WireShade('./wg0.conf'); 
+const { WireShade } = require('wireshade');
+const client = new WireShade('./wg0.conf');
 await client.start();
 ```
 
@@ -114,7 +114,44 @@ const response = await fetch('https://internal.service/api', {
 });
 ```
 
-### 2. TCP & WebSockets to VPN (Client)
+### 2. Local P2P VPN Testing
+You can run two WireShade instances locally to establish a P2P VPN tunnel for testing, connecting them directly via local UDP ports without needing a real server.
+
+```javascript
+const { WireShade, generateKeyPair } = require('wireshade');
+
+const keyA = generateKeyPair();
+const keyB = generateKeyPair();
+
+const clientA = new WireShade({
+    wireguard: {
+        privateKey: keyA.privateKey,
+        peerPublicKey: keyB.publicKey,
+        endpoint: '127.0.0.1:51821', // Point to B's listen port
+        sourceIp: '10.0.0.1',
+        listenPort: 51820 // Listen on this port
+    }
+});
+
+const clientB = new WireShade({
+    wireguard: {
+        privateKey: keyB.privateKey,
+        peerPublicKey: keyA.publicKey,
+        endpoint: '127.0.0.1:51820', // Point to A's listen port
+        sourceIp: '10.0.0.2',
+        listenPort: 51821 // Listen on this port
+    }
+});
+
+await clientA.start();
+await clientB.start();
+
+// Ping from A to B
+const pingTime = await clientA.ping('10.0.0.2');
+console.log(`Ping successful: ${pingTime}ms`);
+```
+
+### 3. TCP & WebSockets to VPN (Client)
 Connect to raw TCP services or WebSockets running inside the VPN.
 
 **Raw TCP:**
@@ -250,6 +287,9 @@ const client = new WireShade({
 
 **`client.getHttpAgent() / client.getHttpsAgent()`**
 - Returns a Node.js `http.Agent` / `https.Agent` configured to route traffic through the tunnel.
+
+**`client.ping(ip)`**
+- Pings a remote host via ICMP and returns a `Promise` resolving to the round trip time in milliseconds.
 
 ---
 
