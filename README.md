@@ -66,7 +66,7 @@ _Note: Windows users need basic build tools (Visual Studio Build Tools) if prebu
 All examples assume you have initialized the client:
 ```javascript
 const { WireShade, readConfig } = require('wireshade');
-const client = new WireShade(readConfig('./wg0.conf'));
+const client = new WireShade('./wg0.conf'); 
 await client.start();
 ```
 
