@@ -22,25 +22,25 @@ jobs:
         settings:
           - host: windows-latest
             target: x86_64-pc-windows-msvc
-            build: npm run build
+            build: npm run build:rs
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             zig: true
-            build: npm run build -- --target x86_64-unknown-linux-gnu --cross-compile
+            build: npm run build:rs -- --target x86_64-unknown-linux-gnu --cross-compile
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             zig: true
-            build: npm run build -- --target aarch64-unknown-linux-gnu --cross-compile
+            build: npm run build:rs -- --target aarch64-unknown-linux-gnu --cross-compile
           - host: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
             zig: true
-            build: npm run build -- --target armv7-unknown-linux-gnueabihf --cross-compile
+            build: npm run build:rs -- --target armv7-unknown-linux-gnueabihf --cross-compile
           - host: macos-latest
             target: x86_64-apple-darwin
-            build: npm run build -- --target x86_64-apple-darwin
+            build: npm run build:rs -- --target x86_64-apple-darwin
           - host: macos-latest
             target: aarch64-apple-darwin
-            build: npm run build -- --target aarch64-apple-darwin
+            build: npm run build:rs -- --target aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -65,6 +65,9 @@ jobs:
 
       - name: Install Dependencies
         run: npm install
+
+      - name: Build TypeScript
+        run: npm run build:ts
 
       - name: Build
         run: ${{ matrix.settings.build }}
@@ -102,6 +105,9 @@ jobs:
         run: |
           mv artifacts/bindings-*/wireshade.*.node .
           ls -R wireshade.*.node
+
+      - name: Build TypeScript
+        run: npm run build:ts
 
       - name: Publish
         env:
