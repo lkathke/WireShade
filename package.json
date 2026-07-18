@@ -1,14 +1,18 @@
 {
   "name": "wireshade",
   "version": "1.0.10",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": "./index.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "files": [
-    "index.js",
-    "lib",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/lib",
     "wireshade.*.node",
     "wireshade.node",
     "README.md",
@@ -26,7 +30,9 @@
     ]
   },
   "scripts": {
-    "build": "napi build --platform --release",
+    "build": "npm run build:rs && npm run build:ts",
+    "build:ts": "tsc -p tsconfig.build.json",
+    "build:rs": "napi build --platform --release",
     "build:debug": "napi build --platform",
     "test": "node test.js"
   },
