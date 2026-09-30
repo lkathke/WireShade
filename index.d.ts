@@ -59,6 +59,12 @@ export interface WsClientOptions {
    * Ignored in native mode.
    */
   remotePort?: number | null
+  /**
+   * Per-connection TCP window (RX+TX socket buffer) in bytes. Omitted / 0 =
+   * 512 KiB (default). A larger window improves throughput on high-latency /
+   * WAN links at the cost of more RAM per connection; clamped to 64 MiB.
+   */
+  tcpBufferSize?: number | null
 }
 
 /** Server TLS options for {@link NativeWireShade.wsServer}. Providing it enables `wss`. */
@@ -85,6 +91,12 @@ export interface WsServerOptions {
   keepaliveSec?: number | null
   /** TLS cert + key PEM. Omit for plaintext `ws`. */
   tls?: WsServerTlsOptions | null
+  /**
+   * Per-connection TCP window (RX+TX socket buffer) in bytes. Omitted / 0 =
+   * 512 KiB (default). A larger window improves throughput on high-latency /
+   * WAN links at the cost of more RAM per connection; clamped to 64 MiB.
+   */
+  tcpBufferSize?: number | null
 }
 
 /** A self-signed certificate and its private key, both PEM-encoded. */
@@ -108,6 +120,9 @@ export declare class NativeWireShade {
    * @param sourceIp            Our IPv4 address inside the tunnel.
    * @param listenPort          Optional local UDP port (default: random).
    * @param persistentKeepalive Optional persistent keepalive in seconds (0 / omitted = off).
+   * @param tcpBufferSize       Optional per-connection TCP window (RX+TX socket
+   *                            buffer) in bytes. Omitted / 0 = 512 KiB (default);
+   *                            larger helps on high-latency links, clamped to 64 MiB.
    */
   constructor(
     privateKey: string,
@@ -116,7 +131,8 @@ export declare class NativeWireShade {
     endpoint: string,
     sourceIp: string,
     listenPort?: number | null,
-    persistentKeepalive?: number | null
+    persistentKeepalive?: number | null,
+    tcpBufferSize?: number | null
   )
 
   /**
@@ -130,7 +146,8 @@ export declare class NativeWireShade {
     endpoint: string,
     sourceIp: string,
     listenPort?: number | null,
-    persistentKeepalive?: number | null
+    persistentKeepalive?: number | null,
+    tcpBufferSize?: number | null
   ): NativeWireShade
 
   /**

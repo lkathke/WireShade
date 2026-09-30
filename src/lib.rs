@@ -28,8 +28,12 @@ use transport::{setup_transport, Transport, TransportConfig, WsClientConfig, WsC
 
 /// MTU of the virtual interface (WireGuard default).
 const MTU: usize = 1420;
-/// Size of each TCP socket's RX and TX buffer.
-const TCP_BUFFER_SIZE: usize = 512 * 1024;
+/// Default size of each TCP socket's RX and TX buffer (the TCP window). Used
+/// when no `tcpBufferSize` option is supplied, so behavior is unchanged.
+const DEFAULT_TCP_BUFFER_SIZE: usize = 512 * 1024;
+/// Hard cap on a configured TCP buffer size, so a bogus value cannot request
+/// an absurd per-connection allocation (RX + TX buffers).
+const MAX_TCP_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 /// Number of sockets kept in the LISTEN state per port. Concurrent SYN bursts
 /// larger than this are still accepted, because LISTEN sockets are replenished
 /// between individual ingress packets (see `Engine::ensure_listen_backlog`).
@@ -388,9 +392,19 @@ fn smol_now() -> smoltcp::time::Instant {
     smoltcp::time::Instant::now()
 }
 
-fn new_tcp_socket() -> tcp::Socket<'static> {
-    let rx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]);
-    let tx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]);
+/// Sanitize a caller-supplied TCP buffer size (bytes): `None` / `0` falls back
+/// to the default (512 KiB, unchanged behavior), anything larger than
+/// `MAX_TCP_BUFFER_SIZE` is clamped down to it.
+fn sanitize_tcp_buffer_size(size: Option<u32>) -> usize {
+    match size {
+        Some(n) if n > 0 => (n as usize).min(MAX_TCP_BUFFER_SIZE),
+        _ => DEFAULT_TCP_BUFFER_SIZE,
+    }
+}
+
+fn new_tcp_socket(buffer_size: usize) -> tcp::Socket<'static> {
+    let rx = tcp::SocketBuffer::new(vec![0; buffer_size]);
+    let tx = tcp::SocketBuffer::new(vec![0; buffer_size]);
     let mut socket = tcp::Socket::new(rx, tx);
     socket.set_nagle_enabled(false);
     // Abort connections whose peer stops acknowledging outstanding data.
@@ -423,6 +437,8 @@ struct Engine {
     iface: Interface,
     sockets: SocketSet<'static>,
     source_ip: Ipv4Address,
+    /// RX/TX buffer size for every TCP socket created by this engine.
+    tcp_buffer_size: usize,
     state_tx: watch::Sender<TunnelState>,
 
     icmp_handle: SocketHandle,
@@ -517,6 +533,7 @@ impl Engine {
         tunn: Tunn,
         transport: Arc<dyn Transport>,
         source_ip: Ipv4Address,
+        tcp_buffer_size: usize,
         state_tx: watch::Sender<TunnelState>,
     ) -> std::result::Result<Self, String> {
         let mut device = VirtualDevice::new(MTU);
@@ -547,6 +564,7 @@ impl Engine {
             iface,
             sockets,
             source_ip,
+            tcp_buffer_size,
             state_tx,
             icmp_handle,
             pending_pings: HashMap::new(),
@@ -823,7 +841,7 @@ impl Engine {
                 }
             }
             while listening < LISTEN_BACKLOG && listener.pool.len() < MAX_LISTEN_POOL {
-                let mut socket = new_tcp_socket();
+                let mut socket = new_tcp_socket(self.tcp_buffer_size);
                 if socket.listen((IpAddress::Ipv4(source_ip), port)).is_err() {
                     break;
                 }
@@ -1036,7 +1054,7 @@ impl Engine {
         ctx: ConnectionContext,
         resp: oneshot::Sender<Result<u32>>,
     ) {
-        let mut socket = new_tcp_socket();
+        let mut socket = new_tcp_socket(self.tcp_buffer_size);
         let local_port = self.alloc_local_port();
         let remote = (IpAddress::Ipv4(dest_ip), dest_port);
         let local = (IpAddress::Ipv4(self.source_ip), local_port);
@@ -1090,7 +1108,7 @@ impl Engine {
 
         let mut pool = Vec::with_capacity(LISTEN_BACKLOG);
         for _ in 0..LISTEN_BACKLOG {
-            let mut socket = new_tcp_socket();
+            let mut socket = new_tcp_socket(self.tcp_buffer_size);
             if let Err(e) = socket.listen((IpAddress::Ipv4(self.source_ip), port)) {
                 for handle in pool {
                     self.sockets.remove(handle);
@@ -1187,6 +1205,7 @@ async fn run_task(
     tunn: Tunn,
     transport_cfg: TransportConfig,
     source_ip: Ipv4Address,
+    tcp_buffer_size: usize,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     state_tx: watch::Sender<TunnelState>,
 ) {
@@ -1216,7 +1235,7 @@ async fn run_task(
         }
     };
 
-    let engine = transport.and_then(|t| Engine::new(tunn, t, source_ip, state_tx.clone()));
+    let engine = transport.and_then(|t| Engine::new(tunn, t, source_ip, tcp_buffer_size, state_tx.clone()));
     match engine {
         Ok(engine) => engine.run(cmd_rx, queued).await,
         Err(msg) => {
@@ -1316,10 +1335,11 @@ fn build_tunnel(
 #[napi]
 impl WireShade {
     /// Spawn the network task for a chosen transport and return the handle.
-    fn spawn(tunn: Tunn, source_ip: Ipv4Address, transport_cfg: TransportConfig) -> Self {
+    /// `tcp_buffer_size` is the already-sanitized per-connection TCP window.
+    fn spawn(tunn: Tunn, source_ip: Ipv4Address, tcp_buffer_size: usize, transport_cfg: TransportConfig) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (state_tx, state_rx) = watch::channel(TunnelState::Connecting);
-        napi::bindgen_prelude::spawn(run_task(tunn, transport_cfg, source_ip, cmd_rx, state_tx));
+        napi::bindgen_prelude::spawn(run_task(tunn, transport_cfg, source_ip, tcp_buffer_size, cmd_rx, state_tx));
         Self {
             handle: TaskHandle { cmd_tx, state_rx },
         }
@@ -1332,8 +1352,11 @@ impl WireShade {
     ///
     /// This positional constructor is kept as-is so the high-level JS API
     /// (`new WireShade(...)`) keeps working; `WireShade.overUdp(...)` is an
-    /// alias with identical behavior.
+    /// alias with identical behavior. The optional trailing `tcpBufferSize`
+    /// (bytes) sets the per-connection TCP window (omitted / 0 = 512 KiB
+    /// default, clamped to 64 MiB); larger helps saturate high-latency links.
     #[napi(constructor)]
+    #[allow(clippy::too_many_arguments)] // positional transport args mirror the WireGuard config
     pub fn new(
         private_key: String,
         peer_public_key: String,
@@ -1342,15 +1365,18 @@ impl WireShade {
         source_ip: String,
         listen_port: Option<u16>,
         persistent_keepalive: Option<u16>,
+        tcp_buffer_size: Option<u32>,
     ) -> Result<Self> {
         let (tunn, source_ip_addr) =
             build_tunnel(&private_key, &peer_public_key, preshared_key.as_deref(), &source_ip, persistent_keepalive)?;
-        Ok(Self::spawn(tunn, source_ip_addr, TransportConfig::Udp { endpoint, listen_port }))
+        let tcp_buffer_size = sanitize_tcp_buffer_size(tcp_buffer_size);
+        Ok(Self::spawn(tunn, source_ip_addr, tcp_buffer_size, TransportConfig::Udp { endpoint, listen_port }))
     }
 
     /// Alias for the positional UDP constructor (`new`), matching the transport
     /// factory naming (`overUdp` / `wsClient` / `wsServer`).
     #[napi(factory)]
+    #[allow(clippy::too_many_arguments)] // positional transport args mirror the WireGuard config
     pub fn over_udp(
         private_key: String,
         peer_public_key: String,
@@ -1359,8 +1385,9 @@ impl WireShade {
         source_ip: String,
         listen_port: Option<u16>,
         persistent_keepalive: Option<u16>,
+        tcp_buffer_size: Option<u32>,
     ) -> Result<Self> {
-        Self::new(private_key, peer_public_key, preshared_key, endpoint, source_ip, listen_port, persistent_keepalive)
+        Self::new(private_key, peer_public_key, preshared_key, endpoint, source_ip, listen_port, persistent_keepalive, tcp_buffer_size)
     }
 
     /// Create the tunnel as a WebSocket client. Connects to `url` (`ws://` or
@@ -1393,7 +1420,8 @@ impl WireShade {
             remote_host: options.remote_host,
             remote_port: options.remote_port,
         };
-        Ok(Self::spawn(tunn, source_ip_addr, TransportConfig::WsClient(cfg)))
+        let tcp_buffer_size = sanitize_tcp_buffer_size(options.tcp_buffer_size);
+        Ok(Self::spawn(tunn, source_ip_addr, tcp_buffer_size, TransportConfig::WsClient(cfg)))
     }
 
     /// Create the tunnel as a WebSocket server. Binds `listen` (`host:port`) and
@@ -1416,7 +1444,8 @@ impl WireShade {
             keepalive_sec: options.keepalive_sec.filter(|&s| s > 0).unwrap_or(20),
             tls,
         };
-        Ok(Self::spawn(tunn, source_ip_addr, TransportConfig::WsServer(cfg)))
+        let tcp_buffer_size = sanitize_tcp_buffer_size(options.tcp_buffer_size);
+        Ok(Self::spawn(tunn, source_ip_addr, tcp_buffer_size, TransportConfig::WsServer(cfg)))
     }
 
     /// Resolves once the WireGuard handshake has completed (immediately if it
@@ -1619,6 +1648,9 @@ pub struct WsClientOptions {
     /// wstunnel mode only: real WireGuard endpoint port (default `51820`).
     /// Ignored in native mode.
     pub remote_port: Option<u16>,
+    /// Per-connection TCP window (RX+TX socket buffer) in bytes. Omitted / 0 =
+    /// 512 KiB (default). Larger helps on high-latency links; clamped to 64 MiB.
+    pub tcp_buffer_size: Option<u32>,
 }
 
 /// Server TLS options for `wsServer`. Providing this enables `wss`.
@@ -1647,6 +1679,9 @@ pub struct WsServerOptions {
     pub keepalive_sec: Option<u32>,
     /// TLS cert + key PEM. Omit for plaintext `ws`.
     pub tls: Option<WsServerTlsOptions>,
+    /// Per-connection TCP window (RX+TX socket buffer) in bytes. Omitted / 0 =
+    /// 512 KiB (default). Larger helps on high-latency links; clamped to 64 MiB.
+    pub tcp_buffer_size: Option<u32>,
 }
 
 /// A self-signed certificate and its private key, both PEM-encoded.

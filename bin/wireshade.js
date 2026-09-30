@@ -61,6 +61,7 @@ socks options:
       --endpoint <host:port> (if no --config) WireGuard UDP endpoint
       --source-ip <ip>       (if no --config) tunnel source IP, e.g. 10.0.0.2
       --keepalive <sec>      persistent keepalive (default 25)
+      --tcp-buffer <size>    TCP window per connection (e.g. 4m); larger = better on high-latency links, more RAM
 
   -t, --transport <udp|ws|wss>   carrier transport (default: udp)
       --url <ws[s]://host:port>  WS server URL (required for ws/wss)
@@ -112,6 +113,19 @@ Examples:
   wireshade bridge --target 127.0.0.1:51820 --tls fullchain.pem:privkey.pem --path-prefix v1
 `;
 
+// Parse a byte size: a plain integer (bytes) or a k/m suffix (e.g. 4m, 512k,
+// 1048576). Returns a positive integer number of bytes, or dies on garbage.
+function parseSize(v) {
+    const s = String(v).trim().toLowerCase();
+    const m = s.match(/^(\d+)([km]?)$/);
+    if (!m) die(`invalid --tcp-buffer "${v}" (use bytes, or a k/m suffix, e.g. 4m)`);
+    let n = parseInt(m[1], 10);
+    if (m[2] === 'k') n *= 1024;
+    else if (m[2] === 'm') n *= 1024 * 1024;
+    if (!Number.isInteger(n) || n <= 0) die(`invalid --tcp-buffer "${v}"`);
+    return n;
+}
+
 function parseListen(v) {
     if (!v) return { host: '127.0.0.1', port: 1080 };
     const s = String(v);
@@ -145,6 +159,11 @@ function buildConfig(o) {
 
     const config = { wireguard, logging: !!o.verbose };
 
+    // Optional per-connection TCP window (bytes). Goes on the transport for
+    // ws/wss and directly on the config for udp (see WireShadeClient._buildGw).
+    const tcpBufferSize = (o['tcp-buffer'] != null && o['tcp-buffer'] !== true)
+        ? parseSize(o['tcp-buffer']) : undefined;
+
     const transport = (o.transport || 'udp').toLowerCase();
     if (transport === 'ws' || transport === 'wss') {
         if (!o.url) die(`--url is required for the ${transport} transport`);
@@ -156,10 +175,13 @@ function buildConfig(o) {
             url: o.url,
             pathPrefix: o['path-prefix'],
             mode: (o.mode && o.mode !== true) ? String(o.mode).toLowerCase() : undefined,
-            tls: Object.keys(tls).length ? tls : undefined
+            tls: Object.keys(tls).length ? tls : undefined,
+            tcpBufferSize
         };
     } else if (transport !== 'udp') {
         die(`unknown transport "${transport}" (use udp, ws or wss)`);
+    } else if (tcpBufferSize !== undefined) {
+        config.tcpBufferSize = tcpBufferSize;
     }
     return config;
 }

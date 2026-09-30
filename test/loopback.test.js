@@ -179,6 +179,33 @@ test('listener handles 10 concurrent connections', async () => {
     }
 });
 
+test('custom tcpBufferSize still does a loopback echo', async () => {
+    // A larger TCP window (4 MiB) must thread through _buildGw -> the native
+    // ctor without breaking anything; a fresh pair is used so the shared peers
+    // keep the default 512 KiB window.
+    const custom = await createPeers({ tcpBufferSize: 4 * 1024 * 1024 });
+    try {
+        await withTimeout(Promise.all([custom.a.start(), custom.b.start()]), 15000, 'handshake (custom buffer)');
+        assert.equal(custom.a.state, ConnectionState.CONNECTED);
+
+        const server = await custom.b.listen(7006, (socket) => {
+            socket.on('error', () => { });
+            socket.pipe(socket); // echo
+        });
+        try {
+            const s = await withTimeout(connect(custom.a, custom.ipB, 7006), 10000, 'connect (custom buffer)');
+            const received = collect(s);
+            s.end('hello big window');
+            const data = await withTimeout(received, 10000, 'echo (custom buffer)');
+            assert.equal(data.toString(), 'hello big window');
+        } finally {
+            server.close();
+        }
+    } finally {
+        await Promise.all([custom.a.close(), custom.b.close()]);
+    }
+});
+
 test('clean shutdown: process exits by itself after close()', async () => {
     const child = spawn(process.execPath, [path.join(__dirname, 'fixtures', 'shutdown.js')], {
         stdio: ['ignore', 'pipe', 'pipe']
