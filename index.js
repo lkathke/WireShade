@@ -8,6 +8,7 @@ const { WireShadeAgent } = require('./lib/agent');
 const { WireShadeClient, ConnectionState } = require('./lib/client');
 const { WireShadeServer } = require('./lib/server');
 const { WireShadeWsServer } = require('./lib/ws_server');
+const { WireShadeSocksServer } = require('./lib/socks_server');
 const { parseWireGuardConfig, readWireGuardConfig } = require('./lib/config_parser');
 const { generateKeyPair } = require('./lib/crypto_utils');
 
@@ -18,6 +19,7 @@ module.exports = {
     WireShadeAgent,
     WireShadeServer,
     WireShadeWsServer,
+    WireShadeSocksServer,
     ConnectionState,
     parseConfig: parseWireGuardConfig,
     readConfig: readWireGuardConfig,

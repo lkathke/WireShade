@@ -241,6 +241,24 @@ export declare class WireShadeServer extends EventEmitter {
   [key: string]: any
 }
 
+/** High-level WebSocket server peer (transport role 'server'). */
+export declare class WireShadeWsServer extends WireShadeClient {
+  constructor(config: Record<string, any>)
+}
+
+/**
+ * A SOCKS5 (CONNECT) proxy that routes every accepted connection through the
+ * tunnel. Create it via `client.socks(port, host?, options?)` or directly.
+ */
+export declare class WireShadeSocksServer extends EventEmitter {
+  constructor(client: WireShadeClient, options?: {
+    auth?: { username: string; password: string } | ((user: string, pass: string) => boolean)
+    logging?: boolean
+  })
+  listen(port: number, host?: string): Promise<WireShadeSocksServer>
+  close(callback?: () => void): void
+}
+
 /** The high-level client is the main export. */
 export { WireShadeClient as WireShade }
 

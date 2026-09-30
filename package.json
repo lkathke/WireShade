@@ -3,12 +3,17 @@
   "version": "1.0.10",
   "main": "index.js",
   "types": "index.d.ts",
+  "bin": {
+    "wireshade": "bin/wireshade.js"
+  },
   "exports": {
     ".": "./index.js"
   },
   "files": [
     "index.js",
+    "index.d.ts",
     "lib",
+    "bin",
     "wireshade.*.node",
     "wireshade.node",
     "README.md",
