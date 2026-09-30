@@ -280,6 +280,74 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 ---
 
+## 🖥️ Command-Line Interface (CLI)
+
+WireShade ships a `wireshade` command that connects a tunnel and exposes a local **SOCKS5 proxy** — no code required. Install it globally, or run it on demand with `npx`. It works the same on **Windows, macOS, and Linux** through the npm bin shim.
+
+```bash
+npm i -g wireshade        # installs the `wireshade` command globally
+# …or run it without installing:
+npx wireshade socks -c wg0.conf
+```
+
+### Commands
+
+| Command | Description |
+| :--- | :--- |
+| `wireshade socks [options]` | Connect and expose a local SOCKS5 proxy |
+| `wireshade unset-proxy` | Restore system proxy settings (crash recovery) |
+| `wireshade genkey` | Print a new WireGuard key pair |
+| `wireshade version` | Print the version |
+| `wireshade help` | Show usage |
+
+### `socks` options
+
+| Option | Description |
+| :--- | :--- |
+| `-c, --config <file>` | WireGuard `.conf` file (`[Interface]` + `[Peer]`) |
+| `--private-key <b64>` | Interface private key (when no `--config`) |
+| `--peer-key <b64>` | Peer public key (when no `--config`) |
+| `--psk <b64>` | Pre-shared key (optional) |
+| `--endpoint <host:port>` | WireGuard UDP endpoint (when no `--config`) |
+| `--source-ip <ip>` | Tunnel source IP, e.g. `10.0.0.2` (when no `--config`) |
+| `--keepalive <sec>` | Persistent keepalive (default `25`) |
+| `-t, --transport <udp\|ws\|wss>` | Carrier transport (default `udp`) |
+| `--url <ws[s]://host:port>` | WS server URL (required for `ws`/`wss`) |
+| `--path-prefix <p>` | WS upgrade path prefix |
+| `--ca <file>` | Pin a PEM certificate (`wss`, self-signed) |
+| `--insecure` | Skip TLS verification (test only) |
+| `-l, --listen <[host:]port>` | Local SOCKS5 bind (default `127.0.0.1:1080`) |
+| `--auth <user:pass>` | Require SOCKS5 username/password |
+| `--dns <ip>` | Resolve hostnames via this DNS server through the tunnel (DNS-over-TCP); defaults to the `.conf` `DNS =` value |
+| `--set-system-proxy` | Point the OS at this proxy; automatically restored on exit |
+| `--proxy-method <pac\|registry>` | Windows only; `pac` (default) = real SOCKS5 via a PAC file, `registry` = `socks=` entry (browsers treat it as SOCKS4) |
+| `--chrome [url]` | Launch Chrome/Edge/Chromium through this proxy in an isolated profile; closing the browser stops wireshade |
+| `--chrome-path <file>` | Browser executable (else auto-detected; also honors `$CHROME_PATH`) |
+| `-v, --verbose` | Log each proxied connection |
+
+### Examples
+
+```bash
+wireshade socks -c wg0.conf
+wireshade socks -c wg0.conf -l 0.0.0.0:1080 --auth alice:secret
+wireshade socks -c wg0.conf -t wss --url wss://vpn.example.com:443 --ca server.pem
+wireshade socks -c wg0.conf --chrome https://example.internal
+wireshade socks -c wg0.conf --set-system-proxy
+```
+
+Once it reports the proxy is listening, point any SOCKS5-aware app at it:
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 http://<vpn-host>/
+```
+
+*   **proxychains:** add `socks5 127.0.0.1 1080` to `proxychains.conf`, then run `proxychains <your-app>`.
+*   **Browser:** set the SOCKS5 host to `127.0.0.1` and the port to `1080` (choose SOCKS v5 with remote DNS so hostnames resolve inside the VPN).
+
+**Full internet through the VPN.** WireShade forwards **any** destination through the tunnel, not just the VPN's own subnet — so full-internet tunneling works **if the WireGuard server is an exit node** (IP forwarding + NAT). The public exit IP is then the server's; WireShade doesn't set it. Pass `--dns <ip>` to keep DNS resolution inside the tunnel too (no leak), which matters for full-tunnel use.
+
+---
+
 ## 🎯 Top 10 Use Cases
 
 Copy-paste recipes for what people reach for most. Every snippet is self-contained — swap in your own keys, IPs, and `.conf` path, and run it after `npm i wireshade`.
@@ -475,7 +543,7 @@ console.log(await client.get('http://10.0.0.1/'));
 
 ### 🍳 More recipes
 
-Six more field-tested patterns — same self-contained style, numbered on from the ten above.
+Seven more field-tested patterns — same self-contained style, numbered on from the ten above.
 
 ### 11. Reuse an existing DB / Redis client, unchanged
 
@@ -614,6 +682,23 @@ await client.start();
 console.log(await client.get('http://10.0.0.1/'));
 ```
 
+### 17. Expose the whole VPN as a SOCKS5 proxy
+
+Run a local SOCKS5 proxy that routes every connection through the tunnel — any SOCKS5-aware app can then reach any host inside the VPN, with no per-service forward.
+
+```js
+const { WireShadeClient } = require('wireshade');
+const client = new WireShadeClient('wg0.conf');
+await client.start();
+// dynamic proxy: any SOCKS5 app can now reach any host inside the VPN
+await client.socks(1080);                       // 127.0.0.1:1080, no auth
+// with auth:  await client.socks(1080, '127.0.0.1', { auth: { username:'alice', password:'secret' } });
+// in-tunnel DNS:  await client.socks(1080, '127.0.0.1', { dns: '10.0.0.1' });
+// then: curl --socks5-hostname 127.0.0.1:1080 http://10.0.0.5/
+```
+
+The CLI does exactly this without writing any code: `wireshade socks -c wg0.conf`.
+
 ---
 
 ## 📚 Examples
@@ -634,6 +719,7 @@ Runnable scripts live in [`examples/`](examples/):
 | `10_remote_forwarding.js` | `forwardRemote` — publish a local service to the VPN. |
 | `11_websocket_wss.js` | WireGuard over WSS using the **native** binding. |
 | `13_websocket_highlevel.js` | WireGuard over WSS using the **high-level** API. |
+| `14_socks_proxy.js` | SOCKS5 proxy over the tunnel. |
 | `local_vpn.js` | Two local peers forming a P2P tunnel for testing. |
 
 ---

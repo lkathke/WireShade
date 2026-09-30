@@ -280,6 +280,74 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 ---
 
+## 🖥️ 命令行界面（CLI）
+
+WireShade 附带一个 `wireshade` 命令，可建立隧道并暴露一个本地 **SOCKS5 代理**——无需编写代码。既可全局安装，也可用 `npx` 按需运行。借助 npm 的 bin shim，它在 **Windows、macOS 和 Linux** 上表现一致。
+
+```bash
+npm i -g wireshade        # installs the `wireshade` command globally
+# …or run it without installing:
+npx wireshade socks -c wg0.conf
+```
+
+### 命令
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `wireshade socks [options]` | 连接并暴露一个本地 SOCKS5 代理 |
+| `wireshade unset-proxy` | 恢复系统代理设置（崩溃恢复） |
+| `wireshade genkey` | 打印一个新的 WireGuard 密钥对 |
+| `wireshade version` | 打印版本号 |
+| `wireshade help` | 显示用法 |
+
+### `socks` 选项
+
+| 选项 | 说明 |
+| :--- | :--- |
+| `-c, --config <file>` | WireGuard `.conf` 文件（`[Interface]` + `[Peer]`） |
+| `--private-key <b64>` | 接口私钥（未提供 `--config` 时） |
+| `--peer-key <b64>` | 对端公钥（未提供 `--config` 时） |
+| `--psk <b64>` | 预共享密钥（可选） |
+| `--endpoint <host:port>` | WireGuard UDP 端点（未提供 `--config` 时） |
+| `--source-ip <ip>` | 隧道源 IP，例如 `10.0.0.2`（未提供 `--config` 时） |
+| `--keepalive <sec>` | 持久保活（默认 `25`） |
+| `-t, --transport <udp\|ws\|wss>` | 承载传输（默认 `udp`） |
+| `--url <ws[s]://host:port>` | WS 服务器 URL（`ws`/`wss` 必需） |
+| `--path-prefix <p>` | WS 升级路径前缀 |
+| `--ca <file>` | 固定一个 PEM 证书（`wss`，自签名） |
+| `--insecure` | 跳过 TLS 验证（仅用于测试） |
+| `-l, --listen <[host:]port>` | 本地 SOCKS5 绑定（默认 `127.0.0.1:1080`） |
+| `--auth <user:pass>` | 要求 SOCKS5 用户名/密码 |
+| `--dns <ip>` | 通过隧道用此 DNS 服务器解析主机名（DNS-over-TCP）；默认使用 `.conf` 的 `DNS =` 值 |
+| `--set-system-proxy` | 将操作系统指向此代理；退出时自动恢复 |
+| `--proxy-method <pac\|registry>` | 仅限 Windows；`pac`（默认）= 通过 PAC 文件的真正 SOCKS5，`registry` = `socks=` 条目（浏览器将其视为 SOCKS4） |
+| `--chrome [url]` | 通过此代理在隔离的配置文件中启动 Chrome/Edge/Chromium；关闭浏览器会停止 wireshade |
+| `--chrome-path <file>` | 浏览器可执行文件（否则自动检测；也遵循 `$CHROME_PATH`） |
+| `-v, --verbose` | 记录每个被代理的连接 |
+
+### 示例
+
+```bash
+wireshade socks -c wg0.conf
+wireshade socks -c wg0.conf -l 0.0.0.0:1080 --auth alice:secret
+wireshade socks -c wg0.conf -t wss --url wss://vpn.example.com:443 --ca server.pem
+wireshade socks -c wg0.conf --chrome https://example.internal
+wireshade socks -c wg0.conf --set-system-proxy
+```
+
+一旦它报告代理正在监听，就把任意支持 SOCKS5 的应用指向它：
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 http://<vpn-host>/
+```
+
+*   **proxychains：** 在 `proxychains.conf` 中加入 `socks5 127.0.0.1 1080`，然后运行 `proxychains <your-app>`。
+*   **浏览器：** 将 SOCKS5 主机设为 `127.0.0.1`、端口设为 `1080`（选择带远程 DNS 的 SOCKS v5，让主机名在 VPN 内部解析）。
+
+**通过 VPN 访问完整互联网。** WireShade 会将**任意**目标通过隧道转发，而不仅仅是 VPN 自身的子网——因此，**只要 WireGuard 服务器是出口节点**（IP 转发 + NAT），完整的互联网隧道就能工作。此时公网出口 IP 是服务器的，而不是 WireShade 设定的。传入 `--dns <ip>` 可让 DNS 解析同样保持在隧道内（无泄漏），这对全隧道使用很重要。
+
+---
+
 ## 🎯 十大使用场景
 
 面向最常见需求的即用型代码示例。每段代码都可独立运行——替换成你自己的密钥、IP 和 `.conf` 路径，在 `npm i wireshade` 之后即可运行。
@@ -475,7 +543,7 @@ console.log(await client.get('http://10.0.0.1/'));
 
 ### 🍳 更多用法
 
-另外六个经过实战检验的模式——延续上面十个的独立风格，编号顺延。
+另外七个经过实战检验的模式——延续上面十个的独立风格，编号顺延。
 
 ### 11. 无需改动，复用现有的数据库 / Redis 客户端
 
@@ -614,6 +682,23 @@ await client.start();
 console.log(await client.get('http://10.0.0.1/'));
 ```
 
+### 17. 将整个 VPN 暴露为 SOCKS5 代理
+
+运行一个本地 SOCKS5 代理，把每个连接都经由隧道转发——任何支持 SOCKS5 的应用随后都能访问 VPN 内部的任意主机，无需为每个服务单独做转发。
+
+```js
+const { WireShadeClient } = require('wireshade');
+const client = new WireShadeClient('wg0.conf');
+await client.start();
+// dynamic proxy: any SOCKS5 app can now reach any host inside the VPN
+await client.socks(1080);                       // 127.0.0.1:1080, no auth
+// with auth:  await client.socks(1080, '127.0.0.1', { auth: { username:'alice', password:'secret' } });
+// in-tunnel DNS:  await client.socks(1080, '127.0.0.1', { dns: '10.0.0.1' });
+// then: curl --socks5-hostname 127.0.0.1:1080 http://10.0.0.5/
+```
+
+CLI 无需编写任何代码即可做到同样的事：`wireshade socks -c wg0.conf`。
+
 ---
 
 ## 📚 示例
@@ -634,6 +719,7 @@ console.log(await client.get('http://10.0.0.1/'));
 | `10_remote_forwarding.js` | `forwardRemote`——把本地服务发布到 VPN。 |
 | `11_websocket_wss.js` | 使用**原生**绑定的 WireGuard over WSS。 |
 | `13_websocket_highlevel.js` | 使用**高层** API 的 WireGuard over WSS。 |
+| `14_socks_proxy.js` | 经由隧道的 SOCKS5 代理。 |
 | `local_vpn.js` | 两个本地对等体构成 P2P 隧道用于测试。 |
 
 ---
