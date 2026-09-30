@@ -35,10 +35,24 @@
     "build:debug": "napi build --platform",
     "test": "node --test \"test/**/*.test.js\""
   },
-  "keywords": [],
+  "keywords": [
+    "wireguard",
+    "vpn",
+    "userspace",
+    "tunnel",
+    "socks5",
+    "socks",
+    "proxy",
+    "port-forwarding",
+    "ssh",
+    "websocket",
+    "wstunnel",
+    "napi",
+    "rust"
+  ],
   "author": "",
   "license": "MIT",
-  "description": "",
+  "description": "Userspace WireGuard for Node.js — a library and an SSH-style CLI: SOCKS5 proxy, TCP/HTTP tunneling, port forwarding and ssh, over UDP or WebSocket (WSS), with no root or TUN device.",
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",
     "express": "^5.2.1"

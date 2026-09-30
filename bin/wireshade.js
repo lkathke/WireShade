@@ -7,6 +7,7 @@ const {
     generateKeyPair
 } = require('../index.js');
 const fs = require('fs');
+const { spawn } = require('child_process');
 
 // --- tiny arg parser (no external deps) -------------------------------------
 function parseArgs(argv) {
@@ -16,6 +17,7 @@ function parseArgs(argv) {
     };
     for (let i = 0; i < argv.length; i++) {
         let a = argv[i];
+        if (a === '--') { opts['--'] = argv.slice(i + 1); break; } // verbatim passthrough
         if (!a.startsWith('-')) { (opts._ = opts._ || []).push(a); continue; }
         a = a.replace(/^--?/, '');
         if (alias[a]) a = alias[a];
@@ -38,9 +40,11 @@ function die(msg, code = 1) {
     process.exit(code);
 }
 
-const USAGE = `wireshade - userspace WireGuard tunnel & SOCKS5 proxy
+const USAGE = `wireshade - userspace WireGuard for Node.js: SSH-style CLI + library
+             (SOCKS5, port-forward, ssh) over UDP or WebSocket, no root needed
 
 Usage:
+  wireshade ssh     [options] [user@]host [-- cmd]   SSH to a host through the tunnel
   wireshade socks   [options]     Connect and expose a local SOCKS5 proxy
   wireshade forward [options]     Connect and forward ports (-L / -R, like ssh)
   wireshade unset-proxy           Restore system proxy settings (crash recovery)
@@ -92,6 +96,8 @@ Examples:
   wireshade socks -c wg0.conf --set-system-proxy
   wireshade forward -c wg0.conf -L 8080:10.0.0.5:80
   wireshade forward -c wg0.conf -R 2222:127.0.0.1:22 -L 5432:10.0.0.9:5432
+  wireshade ssh -c wg0.conf admin@10.0.0.9
+  wireshade ssh -c wg0.conf -t wss --url wss://vpn.example.com:443 admin@10.0.0.9 -- uptime
 `;
 
 function parseListen(v) {
@@ -213,6 +219,42 @@ async function cmdSocks(o) {
     }
 }
 
+async function cmdSsh(o) {
+    const target = (o._ || [])[0];
+    if (!target) die('usage: wireshade ssh [connection flags] [user@]host [-- remote command]');
+    const at = target.indexOf('@');
+    const user = at >= 0 ? target.slice(0, at) : null;
+    const host = at >= 0 ? target.slice(at + 1) : target;
+    const remotePort = (o.port && o.port !== true) ? parseInt(o.port, 10) : 22;
+
+    const config = buildConfig(o);
+    config.logging = false;
+    const client = new WireShadeClient(config);
+    process.stderr.write(`wireshade: connecting ...\n`);
+    await client.start();
+
+    // Forward an ephemeral local port to host:22 through the tunnel, then run ssh to it.
+    const server = await client.forwardLocal(0, host, remotePort);
+    const lp = server.address().port;
+    process.stderr.write(`wireshade: ssh -> ${host}:${remotePort} through the tunnel (localhost:${lp})\n`);
+
+    const sshBin = process.env.WIRESHADE_SSH_BIN || 'ssh';
+    const sshTarget = user ? `${user}@127.0.0.1` : '127.0.0.1';
+    const args = [
+        '-p', String(lp),
+        // Purpose-built option for localhost port-forwards: don't manage/pollute
+        // known_hosts for the loopback address. The tunnel provides the crypto.
+        '-o', 'NoHostAuthenticationForLocalhost=yes',
+        sshTarget,
+        ...(o['--'] || [])
+    ];
+
+    const child = spawn(sshBin, args, { stdio: 'inherit' });
+    const finish = (code) => { Promise.resolve(client.close()).finally(() => process.exit(code || 0)); };
+    child.on('exit', (code) => finish(code));
+    child.on('error', (e) => { process.stderr.write('wireshade: could not launch ssh: ' + e.message + '\n'); finish(1); });
+}
+
 function parseForward(spec) {
     const parts = String(spec).split(':');
     if (parts.length !== 3) die(`invalid forward spec "${spec}" (expected port:host:port)`);
@@ -272,6 +314,9 @@ async function main() {
             break;
         case 'forward':
             await cmdForward(o);
+            break;
+        case 'ssh':
+            await cmdSsh(o);
             break;
         case 'unset-proxy':
             await cmdUnsetProxy(o);
