@@ -309,6 +309,7 @@ npx wireshade socks -c wg0.conf
 | `wireshade ssh [options] [user@]host [-- cmd]` | 通过隧道 SSH 连接到主机 |
 | `wireshade socks [options]` | 连接并暴露一个本地 SOCKS5 代理 |
 | `wireshade forward [options]` | 连接并转发端口（`-L` / `-R`，类似 `ssh`） |
+| `wireshade bridge [options]` | WS(S) → UDP 中继到真正的 WireGuard 服务器 |
 | `wireshade unset-proxy` | 恢复系统代理设置（崩溃恢复） |
 | `wireshade genkey` | 打印一个新的 WireGuard 密钥对 |
 | `wireshade version` | 打印版本号 |
@@ -371,6 +372,26 @@ wireshade forward -c wg0.conf -R 2222:127.0.0.1:22 -L 5432:10.0.0.9:5432
 | :--- | :--- |
 | `-L <localPort:remoteHost:remotePort>` | 将本地端口转发进 VPN（类似 `ssh -L`） |
 | `-R <vpnPort:targetHost:targetPort>` | 将本地服务发布到 VPN 中（类似 `ssh -R`） |
+
+### `bridge` — 中继到真正的 WireGuard 服务器
+
+运行在 **VPS 上**，紧邻一个真正的（内核）WireGuard 出口节点。bridge 会解开 WebSocket 封装，并将原始数据报中继到 `--target`，因此 WireGuard 加密始终保持在客户端与内核服务器之间的端到端状态，由内核完成 NAT → 实现真正的全隧道互联网，并具备 WSS 防火墙穿透能力。它**兼容 wstunnel-v2**，因此标准的 `wstunnel client` 即可对其工作。它**不是开放中继**——数据报始终发往 `--target`。
+
+| 选项 | 说明 |
+| :--- | :--- |
+| `--target <host:port>` | 真正的 UDP WireGuard 服务器，例如 `127.0.0.1:51820`（**必需**） |
+| `--listen <[host:]port>` | 绑定地址（使用 `--tls` 时默认 `0.0.0.0:443`，否则 `:8080`） |
+| `--tls <cert.pem:key.pem>` | 提供 `wss` 服务（省略则为反向代理后的明文 `ws`） |
+| `--path-prefix <p>` | 要求 wstunnel 升级路径 `/<p>/events` |
+| `--timeout <sec>` | 空闲中继超时（默认 `120`） |
+
+```bash
+# On the VPS, next to a kernel WireGuard exit node listening on udp/51820:
+#   (wg-quick up wg0  +  IP forwarding  +  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE)
+wireshade bridge --target 127.0.0.1:51820 --tls fullchain.pem:privkey.pem --path-prefix v1
+```
+
+> 直接与 bridge 通信的原生 WireShade WS 客户端即将推出；如今，标准的 `wstunnel client`（+ 内核 WireGuard）已可通过它工作。
 
 ### 示例
 

@@ -309,6 +309,7 @@ npx wireshade socks -c wg0.conf
 | `wireshade ssh [options] [user@]host [-- cmd]` | Per SSH über den Tunnel zu einem Host verbinden |
 | `wireshade socks [options]` | Verbinden und einen lokalen SOCKS5-Proxy bereitstellen |
 | `wireshade forward [options]` | Verbinden und Ports weiterleiten (`-L` / `-R`, wie `ssh`) |
+| `wireshade bridge [options]` | WS(S) → UDP-Relay zu einem echten WireGuard-Server |
 | `wireshade unset-proxy` | System-Proxy-Einstellungen wiederherstellen (Absturz-Wiederherstellung) |
 | `wireshade genkey` | Ein neues WireGuard-Schlüsselpaar ausgeben |
 | `wireshade version` | Die Version ausgeben |
@@ -371,6 +372,26 @@ Nutzt die **gleichen Verbindungs-Flags wie `socks`** (`-c` / `-t` / `--url` / `-
 | :--- | :--- |
 | `-L <localPort:remoteHost:remotePort>` | Einen lokalen Port ins VPN weiterleiten (wie `ssh -L`) |
 | `-R <vpnPort:targetHost:targetPort>` | Einen lokalen Dienst im VPN bereitstellen (wie `ssh -R`) |
+
+### `bridge` — Relay zu einem echten WireGuard-Server
+
+Läuft **auf einem VPS** neben einem echten (Kernel-)WireGuard-Exit-Knoten. Die Bridge entpackt das WebSocket-Framing und leitet die rohen Datagramme an `--target` weiter, sodass die WireGuard-Verschlüsselung Ende-zu-Ende zwischen dem Client und dem Kernel-Server bleibt und der Kernel das NAT übernimmt → echtes Full-Tunnel-Internet, mit WSS-Firewall-Durchquerung. Sie ist **wstunnel-v2-kompatibel**, sodass ein handelsüblicher `wstunnel client` damit funktioniert. Sie ist **kein offenes Relay** — Datagramme gehen immer an `--target`.
+
+| Option | Beschreibung |
+| :--- | :--- |
+| `--target <host:port>` | Der echte UDP-WireGuard-Server, z. B. `127.0.0.1:51820` (**erforderlich**) |
+| `--listen <[host:]port>` | Bind-Adresse (Standard `0.0.0.0:443` mit `--tls`, sonst `:8080`) |
+| `--tls <cert.pem:key.pem>` | `wss` bereitstellen (weglassen für Klartext-`ws` hinter einem Reverse-Proxy) |
+| `--path-prefix <p>` | Den wstunnel-Upgrade-Pfad `/<p>/events` verlangen |
+| `--timeout <sec>` | Leerlauf-Relay-Timeout (Standard `120`) |
+
+```bash
+# On the VPS, next to a kernel WireGuard exit node listening on udp/51820:
+#   (wg-quick up wg0  +  IP forwarding  +  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE)
+wireshade bridge --target 127.0.0.1:51820 --tls fullchain.pem:privkey.pem --path-prefix v1
+```
+
+> Ein nativer WireShade-WS-Client, der direkt mit der Bridge spricht, kommt bald; heute funktioniert bereits ein handelsüblicher `wstunnel client` (+ Kernel-WireGuard) durch sie hindurch.
 
 ### Beispiele
 
