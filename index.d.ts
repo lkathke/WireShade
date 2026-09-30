@@ -247,6 +247,24 @@ export declare class WireShadeWsServer extends WireShadeClient {
 }
 
 /**
+ * A WebSocket(S) -> UDP relay ("bridge"): terminates a WS tunnel and forwards
+ * the raw datagrams to a real UDP endpoint (e.g. a kernel WireGuard server),
+ * so a WS/wstunnel client reaches a real WireGuard exit node. Runs on the VPS.
+ */
+export declare class WireShadeBridge extends EventEmitter {
+  constructor(options: {
+    target: string
+    pathPrefix?: string
+    tls?: { cert: string; key: string }
+    idleTimeoutSec?: number
+    allow?: string[]
+    logging?: boolean
+  })
+  listen(listen: string): Promise<WireShadeBridge>
+  close(callback?: () => void): void
+}
+
+/**
  * A SOCKS5 (CONNECT) proxy that routes every accepted connection through the
  * tunnel. Create it via `client.socks(port, host?, options?)` or directly.
  */

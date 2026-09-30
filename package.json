@@ -67,5 +67,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lkathke/WireShade.git"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
   }
 }

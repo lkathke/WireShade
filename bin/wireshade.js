@@ -47,6 +47,7 @@ Usage:
   wireshade ssh     [options] [user@]host [-- cmd]   SSH to a host through the tunnel
   wireshade socks   [options]     Connect and expose a local SOCKS5 proxy
   wireshade forward [options]     Connect and forward ports (-L / -R, like ssh)
+  wireshade bridge  [options]     WS(S) -> UDP relay to a real WireGuard server
   wireshade unset-proxy           Restore system proxy settings (crash recovery)
   wireshade genkey                Print a new WireGuard key pair
   wireshade version               Print version
@@ -83,6 +84,13 @@ forward options (same connection flags as socks: -c/-t/--url/--ca/...):
   -R <vpnPort:targetHost:targetPort>     publish a local service into the VPN (ssh -R)
   (both flags are repeatable)
 
+bridge options (a WS/WSS -> UDP relay; runs ON the VPS, next to a kernel WG server):
+      --target <host:port>       the real UDP WireGuard server (e.g. 127.0.0.1:51820)  [required]
+      --listen <[host:]port>     bind address (default 0.0.0.0:443 with --tls, else :8080)
+      --tls <cert.pem:key.pem>   serve wss (omit for plaintext ws behind a reverse proxy)
+      --path-prefix <p>          require the wstunnel upgrade path /<p>/events
+      --timeout <sec>            idle relay timeout (default 120)
+
 Notes:
   Reaching the public internet (not just the VPN range) requires the WireGuard
   server to be an exit node (IP forwarding + NAT). WireShade forwards any host;
@@ -98,6 +106,7 @@ Examples:
   wireshade forward -c wg0.conf -R 2222:127.0.0.1:22 -L 5432:10.0.0.9:5432
   wireshade ssh -c wg0.conf admin@10.0.0.9
   wireshade ssh -c wg0.conf -t wss --url wss://vpn.example.com:443 admin@10.0.0.9 -- uptime
+  wireshade bridge --target 127.0.0.1:51820 --tls fullchain.pem:privkey.pem --path-prefix v1
 `;
 
 function parseListen(v) {
@@ -296,6 +305,41 @@ async function cmdForward(o) {
     process.on('SIGTERM', shutdown);
 }
 
+async function cmdBridge(o) {
+    if (!o.target || o.target === true) die('bridge needs --target <host:port> (e.g. the kernel WireGuard server)');
+    const listen = (o.listen && o.listen !== true) ? o.listen : (o.tls ? '0.0.0.0:443' : '0.0.0.0:8080');
+
+    let tls = null;
+    if (o.tls && o.tls !== true) {
+        const i = String(o.tls).indexOf(':');
+        if (i === -1) die('--tls must be cert.pem:key.pem');
+        tls = { cert: fs.readFileSync(o.tls.slice(0, i), 'utf8'), key: fs.readFileSync(o.tls.slice(i + 1), 'utf8') };
+    }
+
+    const { WireShadeBridge } = require('../lib/bridge');
+    const bridge = new WireShadeBridge({
+        target: o.target,
+        pathPrefix: (o['path-prefix'] && o['path-prefix'] !== true) ? o['path-prefix'] : undefined,
+        tls,
+        idleTimeoutSec: (o.timeout && o.timeout !== true) ? parseInt(o.timeout, 10) : undefined,
+        logging: !!o.verbose
+    });
+
+    await bridge.listen(listen);
+    process.stderr.write(`wireshade: bridge on ${tls ? 'wss' : 'ws'} ${listen} -> udp ${o.target}\n`);
+    process.stderr.write(`wireshade: point a wstunnel client / WireShade WS client at it; datagrams go to ${o.target}\n`);
+
+    let closing = false;
+    const shutdown = () => {
+        if (closing) return;
+        closing = true;
+        process.stderr.write('\nwireshade: shutting down bridge ...\n');
+        bridge.close(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+}
+
 async function cmdUnsetProxy(o) {
     const { unsetSystemProxy } = require('../lib/system_proxy');
     const ok = unsetSystemProxy({ dryRun: !!o['dry-run-proxy'], log: (m) => process.stderr.write('wireshade: ' + m + '\n') });
@@ -317,6 +361,9 @@ async function main() {
             break;
         case 'ssh':
             await cmdSsh(o);
+            break;
+        case 'bridge':
+            await cmdBridge(o);
             break;
         case 'unset-proxy':
             await cmdUnsetProxy(o);
