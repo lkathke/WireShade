@@ -383,6 +383,141 @@ curl --socks5-hostname 127.0.0.1:1080 http://<vpn-host>/
 
 ---
 
+## 🧭 教程：一个 WebSocket VPN 服务器 + 一个 Chrome 客户端
+
+端到端：在一台公网 VM 上运行 WireShade **WS 服务器**，用 **nginx / Nginx Proxy Manager** 在真实域名前面做 TLS 终止，然后从你的笔记本**用 CLI 连接并打开 Chrome**，其流量经隧道路由——两端都无需 root、无需 TUN 设备。
+
+### 1. 生成密钥
+
+运行两次——一次给服务器，一次给客户端——并记下每一对：
+
+```bash
+wireshade genkey
+```
+
+服务器需要它**自己的私钥** + **客户端的公钥**；客户端需要它**自己的私钥** + **服务器的公钥**。
+
+### 2. 服务器对端
+
+CLI 是客户端一侧；WS **服务器**是一段使用 `WireShadeWsServer` 的简短脚本。二选一的 TLS 策略。
+
+**方案 A —— WireShade 自己终止 TLS（`wss://`）**
+
+```javascript
+// server.js
+const { WireShadeWsServer, generateSelfSignedCert } = require('wireshade');
+
+(async () => {
+    // Bring your own PEM (e.g. Let's Encrypt), or generate a self-signed pair:
+    const { certPem, keyPem } = generateSelfSignedCert(['vpn.example.com']);
+
+    const srv = new WireShadeWsServer({
+        listen: '0.0.0.0:443',
+        pathPrefix: 'wg',                    // clients connect to wss://host/wg/...
+        tls: { cert: certPem, key: keyPem }, // omit `tls` for plaintext ws:// (Variant B)
+        wireguard: {
+            privateKey: '<server private key>',
+            peerPublicKey: '<client public key>',
+            sourceIp: '10.0.0.1'
+        }
+    });
+
+    await srv.start();                       // resolves once bound & listening
+    console.log('WS VPN server up on :443, tunnel IP 10.0.0.1');
+
+    // Expose what the client should reach — either host a service on this VM…
+    await srv.listen(8080, (sock) =>
+        sock.on('data', () => sock.end('HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello')));
+
+    // …or publish a service reachable FROM this VM (LAN web app, DB, …) into the tunnel:
+    await srv.forwardRemote(80, '10.10.0.5', 80); // tunnel 10.0.0.1:80 -> internal 10.10.0.5:80
+})();
+```
+
+用 `pm2` 或 `systemd` 单元让它保持运行。
+
+**方案 B —— nginx / Nginx Proxy Manager 在你的域名上终止 TLS（推荐）**
+
+让代理负责域名 + 证书，WireShade 在回环地址上保持明文：
+
+```javascript
+// server.js — behind a TLS-terminating reverse proxy
+const { WireShadeWsServer } = require('wireshade');
+
+(async () => {
+    const srv = new WireShadeWsServer({
+        listen: '127.0.0.1:8000',            // plaintext ws:// on loopback
+        pathPrefix: 'wg',                    // no `tls` block: the proxy does TLS
+        wireguard: {
+            privateKey: '<server private key>',
+            peerPublicKey: '<client public key>',
+            sourceIp: '10.0.0.1'
+        }
+    });
+    await srv.start();
+    console.log('WS VPN server up on 127.0.0.1:8000 (behind the reverse proxy)');
+})();
+```
+
+`vpn.example.com` 的 nginx `server` 块（证书由 `certbot` 签发）：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name vpn.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/vpn.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/vpn.example.com/privkey.pem;
+
+    location /wg/ {                          # must match pathPrefix
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;            # keep the long-lived tunnel open
+    }
+}
+```
+
+**Nginx Proxy Manager（图形界面）：** 新建一个 *Proxy Host* → 域名 `vpn.example.com`，Forward Hostname/Port 填 `127.0.0.1` / `8000`（scheme 选 `http`），启用 **Websockets Support**，在 *SSL* 选项卡申请 Let's Encrypt 证书，并在 *Advanced* 选项卡添加一个带有相同 `Upgrade`/`Connection` 头的 `location /wg/ { … }` 块，使路径前缀匹配。
+
+### 3. 从客户端连接并启动 Chrome
+
+一条 CLI 命令即可通过 WSS 打开隧道，并启动一个流量经隧道路由的**隔离 Chrome**：
+
+```bash
+wireshade socks \
+  -t wss --url wss://vpn.example.com:443 --path-prefix wg \
+  --private-key '<client private key>' \
+  --peer-key    '<server public key>' \
+  --source-ip   10.0.0.2 \
+  --dns 10.0.0.1 \
+  --chrome http://10.0.0.1:8080/
+```
+
+关闭那个 Chrome 窗口会停止 `wireshade` 并拆除隧道。更喜欢用文件？客户端 `.conf` 也可以——注意 WireShade 的解析器仍然要求有一行 `Endpoint`，而 WS 传输会忽略它：
+
+```ini
+# client-wg.conf
+[Interface]
+PrivateKey = <client private key>
+Address    = 10.0.0.2/32
+DNS        = 10.0.0.1
+
+[Peer]
+PublicKey = <server public key>
+Endpoint  = vpn.example.com:443   # required by the parser; unused for ws/wss
+```
+
+```bash
+wireshade socks -c client-wg.conf -t wss --url wss://vpn.example.com:443 --path-prefix wg --chrome http://10.0.0.1:8080/
+```
+
+> **WS 服务器的作用范围。** 用户态的 WireShade WS 对端只在它**自己的**隧道 IP（`10.0.0.1`）以及你用 `forwardRemote()` 发布的内容上响应——非常适合访问内部仪表盘、数据库和 Web 应用。**完整的公网出口**（通过 VPN 访问任意站点）需要 WireGuard **服务器充当出口节点**（IP 转发 + NAT）——即基于 `udp` 传输的内核 WireGuard 机器，而不是用户态 WS 对端。
+
+---
+
 ## 🎯 十大使用场景
 
 面向最常见需求的即用型代码示例。每段代码都可独立运行——替换成你自己的密钥、IP 和 `.conf` 路径，在 `npm i wireshade` 之后即可运行。

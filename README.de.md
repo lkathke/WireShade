@@ -383,6 +383,141 @@ curl --socks5-hostname 127.0.0.1:1080 http://<vpn-host>/
 
 ---
 
+## 🧭 Tutorial: ein WebSocket-VPN-Server + ein Chrome-Client
+
+Von Anfang bis Ende: Betreibe einen WireShade-**WS-Server** auf einer öffentlichen VM, stelle **nginx / Nginx Proxy Manager** mit einer echten Domain davor (TLS) und **verbinde dich dann per CLI und öffnest Chrome**, dessen Verkehr durch den Tunnel läuft — ohne Root und ohne TUN-Gerät auf beiden Seiten.
+
+### 1. Schlüssel erzeugen
+
+Führe dies zweimal aus — einmal für den Server, einmal für den Client — und notiere jedes Paar:
+
+```bash
+wireshade genkey
+```
+
+Der Server braucht seinen **eigenen privaten Schlüssel** + den **öffentlichen Schlüssel des Clients**; der Client braucht seinen **eigenen privaten Schlüssel** + den **öffentlichen Schlüssel des Servers**.
+
+### 2. Der Server-Peer
+
+Die CLI ist die Client-Seite; der WS-**Server** ist ein kurzes Skript mit `WireShadeWsServer`. Wähle eine von zwei TLS-Strategien.
+
+**Variante A — WireShade terminiert TLS selbst (`wss://`)**
+
+```javascript
+// server.js
+const { WireShadeWsServer, generateSelfSignedCert } = require('wireshade');
+
+(async () => {
+    // Bring your own PEM (e.g. Let's Encrypt), or generate a self-signed pair:
+    const { certPem, keyPem } = generateSelfSignedCert(['vpn.example.com']);
+
+    const srv = new WireShadeWsServer({
+        listen: '0.0.0.0:443',
+        pathPrefix: 'wg',                    // clients connect to wss://host/wg/...
+        tls: { cert: certPem, key: keyPem }, // omit `tls` for plaintext ws:// (Variant B)
+        wireguard: {
+            privateKey: '<server private key>',
+            peerPublicKey: '<client public key>',
+            sourceIp: '10.0.0.1'
+        }
+    });
+
+    await srv.start();                       // resolves once bound & listening
+    console.log('WS VPN server up on :443, tunnel IP 10.0.0.1');
+
+    // Expose what the client should reach — either host a service on this VM…
+    await srv.listen(8080, (sock) =>
+        sock.on('data', () => sock.end('HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello')));
+
+    // …or publish a service reachable FROM this VM (LAN web app, DB, …) into the tunnel:
+    await srv.forwardRemote(80, '10.10.0.5', 80); // tunnel 10.0.0.1:80 -> internal 10.10.0.5:80
+})();
+```
+
+Halte es mit `pm2` oder einer `systemd`-Unit am Laufen.
+
+**Variante B — nginx / Nginx Proxy Manager terminiert TLS auf deiner Domain (empfohlen)**
+
+Lass den Proxy Domain + Zertifikat verwalten und halte WireShade im Klartext auf Loopback:
+
+```javascript
+// server.js — behind a TLS-terminating reverse proxy
+const { WireShadeWsServer } = require('wireshade');
+
+(async () => {
+    const srv = new WireShadeWsServer({
+        listen: '127.0.0.1:8000',            // plaintext ws:// on loopback
+        pathPrefix: 'wg',                    // no `tls` block: the proxy does TLS
+        wireguard: {
+            privateKey: '<server private key>',
+            peerPublicKey: '<client public key>',
+            sourceIp: '10.0.0.1'
+        }
+    });
+    await srv.start();
+    console.log('WS VPN server up on 127.0.0.1:8000 (behind the reverse proxy)');
+})();
+```
+
+nginx-`server`-Block für `vpn.example.com` (Zertifikat via `certbot`):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name vpn.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/vpn.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/vpn.example.com/privkey.pem;
+
+    location /wg/ {                          # must match pathPrefix
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;            # keep the long-lived tunnel open
+    }
+}
+```
+
+**Nginx Proxy Manager (GUI):** lege einen *Proxy Host* an → Domain `vpn.example.com`, Forward Hostname/Port `127.0.0.1` / `8000` (Schema `http`), aktiviere **Websockets Support**, fordere im *SSL*-Tab ein Let's-Encrypt-Zertifikat an und füge im *Advanced*-Tab einen `location /wg/ { … }`-Block mit denselben `Upgrade`/`Connection`-Headern hinzu, damit der Path-Prefix passt.
+
+### 3. Vom Client verbinden und Chrome starten
+
+Ein einziger CLI-Befehl öffnet den Tunnel über WSS und startet ein **isoliertes Chrome**, dessen Verkehr hindurchläuft:
+
+```bash
+wireshade socks \
+  -t wss --url wss://vpn.example.com:443 --path-prefix wg \
+  --private-key '<client private key>' \
+  --peer-key    '<server public key>' \
+  --source-ip   10.0.0.2 \
+  --dns 10.0.0.1 \
+  --chrome http://10.0.0.1:8080/
+```
+
+Das Schließen dieses Chrome-Fensters beendet `wireshade` und baut den Tunnel ab. Lieber eine Datei? Eine Client-`.conf` geht auch — beachte: WireShades Parser verlangt weiterhin eine `Endpoint`-Zeile, die der WS-Transport ignoriert:
+
+```ini
+# client-wg.conf
+[Interface]
+PrivateKey = <client private key>
+Address    = 10.0.0.2/32
+DNS        = 10.0.0.1
+
+[Peer]
+PublicKey = <server public key>
+Endpoint  = vpn.example.com:443   # required by the parser; unused for ws/wss
+```
+
+```bash
+wireshade socks -c client-wg.conf -t wss --url wss://vpn.example.com:443 --path-prefix wg --chrome http://10.0.0.1:8080/
+```
+
+> **Reichweite des WS-Servers.** Ein Userspace-WireShade-WS-Peer antwortet auf seiner **eigenen** Tunnel-IP (`10.0.0.1`) und auf allem, was du per `forwardRemote()` veröffentlichst — ideal für interne Dashboards, Datenbanken und Web-Apps. **Voller Zugang ins öffentliche Internet** (beliebige Seiten durch das VPN) erfordert, dass der WireGuard-**Server ein Exit-Node ist** (IP-Forwarding + NAT) — eine Kernel-WireGuard-Maschine über den `udp`-Transport, kein Userspace-WS-Peer.
+
+---
+
 ## 🎯 Die 10 wichtigsten Anwendungsfälle
 
 Copy-and-paste-Rezepte für die häufigsten Aufgaben. Jedes Snippet ist eigenständig – ersetze einfach Schlüssel, IPs und den `.conf`-Pfad durch deine eigenen und führe es nach `npm i wireshade` aus.
