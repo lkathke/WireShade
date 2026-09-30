@@ -1,20 +1,13 @@
-const fs = require('fs');
-const path = require('path');
+'use strict';
 
-let binding;
-try {
-    binding = require('./wireshade.node');
-} catch (e) {
-    try {
-        binding = require('./wireshade.win32-x64-msvc.node');
-    } catch (e2) {
-        throw new Error('Could not load native binding');
-    }
-}
+const { getBinding, generateSelfSignedCert } = require('./lib/binding');
+
+const binding = getBinding();
 
 const { WireShadeAgent } = require('./lib/agent');
 const { WireShadeClient, ConnectionState } = require('./lib/client');
 const { WireShadeServer } = require('./lib/server');
+const { WireShadeWsServer } = require('./lib/ws_server');
 const { parseWireGuardConfig, readWireGuardConfig } = require('./lib/config_parser');
 const { generateKeyPair } = require('./lib/crypto_utils');
 
@@ -24,8 +17,12 @@ module.exports = {
     WireShadeClient,
     WireShadeAgent,
     WireShadeServer,
+    WireShadeWsServer,
     ConnectionState,
     parseConfig: parseWireGuardConfig,
     readConfig: readWireGuardConfig,
-    generateKeyPair
+    readWireGuardConfig,
+    parseWireGuardConfig,
+    generateKeyPair,
+    generateSelfSignedCert
 };

@@ -8,7 +8,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 napi = { version = "2.12", features = ["tokio_rt", "async"] }
-napi-derive = "2.12"
+# type-def disabled: napi-rs CLI v3 cannot read v2 type defs and would overwrite
+# the hand-written index.d.ts (and generate a JS binding over index.js).
+napi-derive = { version = "2.12", default-features = false, features = ["compat-mode", "strict"] }
 # Core networking
 tokio = { version = "1", features = ["full"] }
 # The userspace TCP/IP stack
@@ -16,12 +18,20 @@ smoltcp = { version = "0.12", features = ["std", "medium-ip", "proto-ipv4", "soc
 # WireGuard implementation (Cloudflare)
 boringtun = "0.6"
 # Utilities
-bytes = "1"
-thiserror = "1"
-hex = "0.4"
 base64 = "0.21"
 log = "0.4"
 env_logger = "0.10"
+# WebSocket transport (WS / WSS)
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink", "async-await"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# TLS via rustls with the ring provider (avoids the heavy aws-lc-rs build deps)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+# Self-signed certificate helper (ring backend to match rustls)
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [build-dependencies]
 napi-build = "2.0"

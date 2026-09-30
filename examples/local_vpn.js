@@ -35,16 +35,11 @@ const clientB = new WireShadeClient({
 
 async function runTest() {
     try {
-        console.log("Starting Client A...");
-        await clientA.start();
-        console.log("✅ Client A started.\n");
-
-        console.log("Starting Client B...");
-        await clientB.start();
-        console.log("✅ Client B started.\n");
-
-        // Wait a moment for handshake
-        await new Promise(r => setTimeout(r, 2000));
+        // Both peers must be started concurrently: start() resolves only after a
+        // real WireGuard handshake, which needs the other side to be up.
+        console.log("Starting Client A and Client B...");
+        await Promise.all([clientA.start(), clientB.start()]);
+        console.log("✅ Both peers connected (handshake complete).\n");
 
         // Let's create a server on Client B that listens inside the VPN tunnel
         console.log("Setting up VPN Server on Client B port 8080...");
@@ -80,22 +75,24 @@ async function runTest() {
 
         conn.on('data', (data) => {
             console.log(`✅ [Client A] Received response: ${data.toString()}`);
-            setTimeout(() => {
+            setTimeout(async () => {
                 console.log("\nTest complete! Shutting down.");
-                clientA.close();
-                clientB.close();
-                process.exit(0);
+                // close() shuts down the native tunnels; the process exits by itself.
+                await Promise.all([clientA.close(), clientB.close()]);
             }, 500);
         });
 
         conn.on('error', (err) => {
             console.error("❌ [Client A] Connection error:", err);
-            process.exit(1);
+            process.exitCode = 1;
+            clientA.close();
+            clientB.close();
         });
 
     } catch (err) {
         console.error("❌ Test failed:", err);
-        process.exit(1);
+        process.exitCode = 1;
+        await Promise.all([clientA.close(), clientB.close()]);
     }
 }
 

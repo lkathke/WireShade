@@ -2,25 +2,67 @@
 
 #[macro_use]
 extern crate napi_derive;
-extern crate log;
 
+use base64::{engine::general_purpose, Engine as _};
+use boringtun::noise::{Tunn, TunnResult};
+use log::{debug, error, info, trace, warn};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use smoltcp::iface::{Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet};
+use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::{icmp, tcp};
+use smoltcp::wire::{IpAddress, Icmpv4Packet, Icmpv4Repr, Ipv4Address, Ipv4Cidr};
+use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasher, Hasher};
+use std::io;
 use std::str::FromStr;
-use tokio::sync::{mpsc, oneshot};
-use tokio::net::UdpSocket;
-use smoltcp::iface::{Interface, SocketSet, Config, SocketStorage, Route};
-use smoltcp::socket::tcp;
-use smoltcp::wire::{IpAddress, Ipv4Address, IpCidr, IpProtocol, Ipv4Packet};
-use smoltcp::time::Instant;
-use smoltcp::phy::{Device, Medium, RxToken, TxToken};
-use boringtun::noise::{Tunn, TunnResult};
-use base64::{Engine as _, engine::general_purpose};
-use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
 
-// --- Command Enum ---
+mod transport;
+use transport::{setup_transport, Transport, TransportConfig, WsClientConfig, WsServerConfig};
+
+// --- Tunables ---
+
+/// MTU of the virtual interface (WireGuard default).
+const MTU: usize = 1420;
+/// Size of each TCP socket's RX and TX buffer.
+const TCP_BUFFER_SIZE: usize = 512 * 1024;
+/// Number of sockets kept in the LISTEN state per port. Concurrent SYN bursts
+/// larger than this are still accepted, because LISTEN sockets are replenished
+/// between individual ingress packets (see `Engine::ensure_listen_backlog`).
+const LISTEN_BACKLOG: usize = 4;
+/// Hard cap on sockets held by one listener's pool (LISTEN + in-flight
+/// handshakes), i.e. the largest concurrent SYN burst absorbed before excess
+/// SYNs are reset. Bounds memory under a SYN flood.
+const MAX_LISTEN_POOL: usize = 64;
+/// How long a client connect may stay in SYN-SENT before it is rejected.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// smoltcp retransmission timeout: abort if the peer is silent this long while data is unacked.
+const TCP_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(60);
+/// How long an ICMP echo request waits for its reply.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+/// Default timeout for `waitForHandshake`.
+const DEFAULT_HANDSHAKE_TIMEOUT_MS: u32 = 10_000;
+/// Interval for boringtun's `update_timers` and other housekeeping.
+const TIMER_INTERVAL: Duration = Duration::from_millis(250);
+/// After the peer half-closed a connection, close our side automatically if
+/// JS has not done so within this time (prevents leaking half-open sockets).
+const HALF_CLOSE_LINGER: Duration = Duration::from_secs(30);
+/// Upper bounds for work done per loop iteration, so no source starves the others.
+const MAX_DATAGRAMS_PER_ITER: usize = 256;
+const MAX_COMMANDS_PER_ITER: usize = 64;
+const MAX_EGRESS_ROUNDS: usize = 64;
+/// Safety bound on ingress packets processed per `poll_iface` call.
+const MAX_INGRESS_PACKETS: usize = 2048;
+/// Identifier used for our ICMP echo requests.
+const ICMP_IDENT: u16 = 0x1234;
+const EPHEMERAL_PORT_START: u16 = 49152;
+
+// --- Commands (JS -> network task) ---
+
 enum NetworkCommand {
     Connect {
         dest_ip: Ipv4Address,
@@ -32,32 +74,71 @@ enum NetworkCommand {
     SendData {
         connection_id: u32,
         data: Vec<u8>,
+        resp: oneshot::Sender<Result<()>>,
     },
     Close {
         connection_id: u32,
     },
+    /// Stop draining this connection's RX queue (inbound backpressure).
+    Pause {
+        connection_id: u32,
+    },
+    /// Resume draining this connection's RX queue.
+    Resume {
+        connection_id: u32,
+    },
     Listen {
         port: u16,
-        on_connection: ThreadsafeFunction<(u32, String, u16)>, // Returns (conn_id, remote_ip, remote_port)
-        // We reuse the same on_data/on_close logic, but we need to store these callbacks for the listener
-        // so we can attach them to new server connections.
-        on_data: ThreadsafeFunction<(u32, Buffer)>, // (conn_id, data) - Note we need conn_id here to mux!
-        on_close: ThreadsafeFunction<u32>, // (conn_id)
+        /// (conn_id, remote_ip, remote_port)
+        on_connection: ThreadsafeFunction<(u32, String, u16)>,
+        /// (conn_id, data)
+        on_data: ThreadsafeFunction<(u32, Buffer)>,
+        /// (conn_id)
+        on_close: ThreadsafeFunction<u32>,
         resp: oneshot::Sender<Result<()>>,
     },
     Ping {
         dest_ip: Ipv4Address,
         resp: oneshot::Sender<Result<u32>>,
     },
+    Shutdown {
+        resp: oneshot::Sender<()>,
+    },
 }
 
-// Struct to store listener callback info
-struct ListenerInfo {
-    port: u16,
-    on_connection: ThreadsafeFunction<(u32, String, u16)>,
-    on_data: ThreadsafeFunction<(u32, Buffer)>,
-    on_close: ThreadsafeFunction<u32>,
+impl NetworkCommand {
+    /// Answer the command with an error without executing it.
+    fn reject(self, msg: &str) {
+        match self {
+            NetworkCommand::Connect { resp, .. } | NetworkCommand::Ping { resp, .. } => {
+                let _ = resp.send(Err(Error::from_reason(msg)));
+            }
+            NetworkCommand::SendData { resp, .. } | NetworkCommand::Listen { resp, .. } => {
+                let _ = resp.send(Err(Error::from_reason(msg)));
+            }
+            NetworkCommand::Shutdown { resp } => {
+                let _ = resp.send(());
+            }
+            NetworkCommand::Close { .. } | NetworkCommand::Pause { .. } | NetworkCommand::Resume { .. } => {}
+        }
+    }
 }
+
+// --- Tunnel state (network task -> JS) ---
+
+#[derive(Clone, Debug)]
+enum TunnelState {
+    /// Setup running or WireGuard handshake not (yet / any longer) complete.
+    Connecting,
+    /// WireGuard session established.
+    Ready,
+    /// Setup failed (DNS, UDP bind, ...). The task has terminated.
+    Failed(String),
+    /// Shut down. The task has terminated.
+    Closed,
+}
+
+// --- Connection bookkeeping ---
 
 enum ConnectionContext {
     Client {
@@ -67,22 +148,170 @@ enum ConnectionContext {
     Server {
         on_data: ThreadsafeFunction<(u32, Buffer)>,
         on_close: ThreadsafeFunction<u32>,
+    },
+}
+
+/// Data waiting to be copied into the smoltcp TX buffer.
+struct PendingSend {
+    data: Vec<u8>,
+    offset: usize,
+    resp: oneshot::Sender<Result<()>>,
+}
+
+struct TcpConnection {
+    handle: SocketHandle,
+    ctx: ConnectionContext,
+    /// `false` while a client connect is still in SYN-SENT.
+    established: bool,
+    /// Responder of a client connect that is not yet established.
+    connect_resp: Option<oneshot::Sender<Result<u32>>>,
+    connect_deadline: std::time::Instant,
+    pending: VecDeque<PendingSend>,
+    /// JS asked to close; FIN is sent once `pending` is drained.
+    close_requested: bool,
+    /// `socket.close()` has been called.
+    fin_sent: bool,
+    /// `on_close` has been delivered to JS.
+    close_signaled: bool,
+    /// When the peer's FIN (EOF) was observed.
+    eof_at: Option<std::time::Instant>,
+    /// While `true` the engine stops draining this socket's RX queue, so its
+    /// TCP window closes and the peer throttles (inbound backpressure).
+    paused: bool,
+}
+
+impl TcpConnection {
+    fn new(handle: SocketHandle, ctx: ConnectionContext, established: bool) -> Self {
+        Self {
+            handle,
+            ctx,
+            established,
+            connect_resp: None,
+            connect_deadline: std::time::Instant::now() + CONNECT_TIMEOUT,
+            pending: VecDeque::new(),
+            close_requested: false,
+            fin_sent: false,
+            close_signaled: false,
+            eof_at: None,
+            paused: false,
+        }
+    }
+
+    fn deliver_data(&self, id: u32, data: Vec<u8>) {
+        let buffer = Buffer::from(data);
+        match &self.ctx {
+            ConnectionContext::Client { on_data, .. } => {
+                on_data.call(Ok(buffer), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+            ConnectionContext::Server { on_data, .. } => {
+                on_data.call(Ok((id, buffer)), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+    }
+
+    /// Deliver `on_close` exactly once.
+    fn signal_close(&mut self, id: u32) {
+        if self.close_signaled {
+            return;
+        }
+        self.close_signaled = true;
+        debug!("[TCP] connection {} closed", id);
+        match &self.ctx {
+            ConnectionContext::Client { on_close, .. } => {
+                on_close.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+            ConnectionContext::Server { on_close, .. } => {
+                on_close.call(Ok(id), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+    }
+
+    fn fail_pending(&mut self, msg: &str) {
+        for p in self.pending.drain(..) {
+            let _ = p.resp.send(Err(Error::from_reason(msg)));
+        }
+    }
+
+    /// Move as much pending data as possible into the socket's TX buffer.
+    /// A send is acknowledged only once all of its bytes are queued.
+    fn flush_pending(&mut self, socket: &mut tcp::Socket<'_>) {
+        while let Some(front) = self.pending.front_mut() {
+            if !socket.can_send() {
+                break;
+            }
+            match socket.send_slice(&front.data[front.offset..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    front.offset += n;
+                    if front.offset >= front.data.len() {
+                        if let Some(done) = self.pending.pop_front() {
+                            let _ = done.resp.send(Ok(()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("[TCP] send_slice failed: {:?}", e);
+                    break;
+                }
+            }
+        }
+        if !self.pending.is_empty() && self.established && !socket.may_send() {
+            self.fail_pending("Connection closed before data could be sent");
+        }
     }
 }
 
+struct Listener {
+    on_connection: ThreadsafeFunction<(u32, String, u16)>,
+    on_data: ThreadsafeFunction<(u32, Buffer)>,
+    on_close: ThreadsafeFunction<u32>,
+    /// Pool of sockets in LISTEN / SYN-RECEIVED state.
+    pool: Vec<SocketHandle>,
+}
+
+struct PendingPing {
+    resp: oneshot::Sender<Result<u32>>,
+    started: std::time::Instant,
+}
+
 // --- Virtual Device (IP) ---
+
 struct VirtualDevice {
-    rx_queue: std::collections::VecDeque<Vec<u8>>,
-    tx_queue: std::collections::VecDeque<Vec<u8>>,
+    rx_queue: VecDeque<Vec<u8>>,
+    tx_queue: VecDeque<Vec<u8>>,
+    /// Recycled packet buffers to avoid an allocation per packet.
+    pool: Vec<Vec<u8>>,
     mtu: usize,
+}
+
+const DEVICE_POOL_MAX: usize = 256;
+
+fn take_buf(pool: &mut Vec<Vec<u8>>, len: usize) -> Vec<u8> {
+    let mut buf = pool.pop().unwrap_or_default();
+    buf.clear();
+    buf.resize(len, 0);
+    buf
 }
 
 impl VirtualDevice {
     fn new(mtu: usize) -> Self {
         Self {
-            rx_queue: std::collections::VecDeque::new(),
-            tx_queue: std::collections::VecDeque::new(),
+            rx_queue: VecDeque::new(),
+            tx_queue: VecDeque::new(),
+            pool: Vec::new(),
             mtu,
+        }
+    }
+
+    fn push_rx(&mut self, packet: &[u8]) {
+        let mut buf = take_buf(&mut self.pool, 0);
+        buf.extend_from_slice(packet);
+        self.rx_queue.push_back(buf);
+    }
+
+    fn recycle(&mut self, buf: Vec<u8>) {
+        if self.pool.len() < DEVICE_POOL_MAX {
+            self.pool.push(buf);
         }
     }
 }
@@ -91,32 +320,30 @@ impl Device for VirtualDevice {
     type RxToken<'a> = RxTokenVec;
     type TxToken<'a> = TxTokenVec<'a>;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buffer) = self.rx_queue.pop_front() {
-            let rx = RxTokenVec { buffer };
-            let tx = TxTokenVec { queue: &mut self.tx_queue };
-            Some((rx, tx))
-        } else {
-            None
-        }
+    fn receive(&mut self, _timestamp: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let buffer = self.rx_queue.pop_front()?;
+        Some((
+            RxTokenVec { buffer },
+            TxTokenVec {
+                queue: &mut self.tx_queue,
+                pool: &mut self.pool,
+            },
+        ))
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(TxTokenVec { queue: &mut self.tx_queue })
+    fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        Some(TxTokenVec {
+            queue: &mut self.tx_queue,
+            pool: &mut self.pool,
+        })
     }
 
-    fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
-        let mut caps = smoltcp::phy::DeviceCapabilities::default();
-        caps.medium = Medium::Ip; 
-        caps.max_transmission_unit = self.mtu; 
-        
-        // Revert to Both: This worked for Handshake!
-        // It seems the server accepts our packets even without calculated checksums (or 0),
-        // but rejects them if we try to calculate them (maybe incorrectly?).
-        // Or maybe Checksum::Rx capability logic in smoltcp is different than assumed.
-        caps.checksum.ipv4 = smoltcp::phy::Checksum::Both;
-        caps.checksum.tcp = smoltcp::phy::Checksum::Both;
-        
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ip;
+        caps.max_transmission_unit = self.mtu;
+        caps.checksum.ipv4 = Checksum::Both;
+        caps.checksum.tcp = Checksum::Both;
         caps
     }
 }
@@ -130,37 +357,897 @@ impl RxToken for RxTokenVec {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        // Simple IP packet passthrough
         f(&self.buffer)
     }
 }
 
 struct TxTokenVec<'a> {
-    queue: &'a mut std::collections::VecDeque<Vec<u8>>,
+    queue: &'a mut VecDeque<Vec<u8>>,
+    pool: &'a mut Vec<Vec<u8>>,
 }
 
-impl<'a> TxToken for TxTokenVec<'a> {
+impl TxToken for TxTokenVec<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
+        let mut buffer = take_buf(self.pool, len);
         let result = f(&mut buffer);
-        // Simple IP packet passthrough
         self.queue.push_back(buffer);
         result
     }
 }
 
-// --- WireShade ---
+// --- Helpers ---
 
+fn random_u64() -> u64 {
+    RandomState::new().build_hasher().finish()
+}
+
+fn smol_now() -> smoltcp::time::Instant {
+    smoltcp::time::Instant::now()
+}
+
+fn new_tcp_socket() -> tcp::Socket<'static> {
+    let rx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]);
+    let tx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]);
+    let mut socket = tcp::Socket::new(rx, tx);
+    socket.set_nagle_enabled(false);
+    // Abort connections whose peer stops acknowledging outstanding data.
+    socket.set_timeout(Some(TCP_TIMEOUT));
+    socket
+}
+
+/// Read everything currently available in the socket's RX buffer.
+fn drain_recv(socket: &mut tcp::Socket<'_>) -> Vec<u8> {
+    let mut data = Vec::with_capacity(socket.recv_queue());
+    while socket.can_recv() {
+        let res = socket.recv(|chunk| {
+            data.extend_from_slice(chunk);
+            (chunk.len(), chunk.len())
+        });
+        match res {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    data
+}
+
+// --- Network engine (runs inside one tokio task) ---
+
+struct Engine {
+    tunn: Tunn,
+    transport: Arc<dyn Transport>,
+    device: VirtualDevice,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    source_ip: Ipv4Address,
+    state_tx: watch::Sender<TunnelState>,
+
+    icmp_handle: SocketHandle,
+    pending_pings: HashMap<u16, PendingPing>,
+    ping_seq: u16,
+
+    connections: HashMap<u32, TcpConnection>,
+    listeners: HashMap<u16, Listener>,
+    next_conn_id: u32,
+    next_local_port: u16,
+
+    /// Incoming UDP datagram buffer.
+    udp_buf: Vec<u8>,
+    /// Output buffer for boringtun (encapsulate / decapsulate / timers).
+    wg_buf: Vec<u8>,
+}
+
+/// Result of handling a command.
+enum Flow {
+    Continue,
+    Shutdown(Option<oneshot::Sender<()>>),
+}
+
+impl Engine {
+    fn new(
+        tunn: Tunn,
+        transport: Arc<dyn Transport>,
+        source_ip: Ipv4Address,
+        state_tx: watch::Sender<TunnelState>,
+    ) -> std::result::Result<Self, String> {
+        let mut device = VirtualDevice::new(MTU);
+        let mut sockets = SocketSet::new(vec![]);
+
+        let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+        config.random_seed = random_u64();
+        let mut iface = Interface::new(config, &mut device, smol_now());
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(Ipv4Cidr::new(source_ip, 32).into());
+        });
+
+        let icmp_rx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 16], vec![0; 4096]);
+        let icmp_tx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 16], vec![0; 4096]);
+        let mut icmp_socket = icmp::Socket::new(icmp_rx, icmp_tx);
+        icmp_socket
+            .bind(icmp::Endpoint::Ident(ICMP_IDENT))
+            .map_err(|e| format!("Failed to bind ICMP socket: {:?}", e))?;
+        let icmp_handle = sockets.add(icmp_socket);
+
+        let port_range = u64::from(u16::MAX - EPHEMERAL_PORT_START) + 1;
+        let next_local_port = EPHEMERAL_PORT_START + (random_u64() % port_range) as u16;
+
+        Ok(Self {
+            tunn,
+            transport,
+            device,
+            iface,
+            sockets,
+            source_ip,
+            state_tx,
+            icmp_handle,
+            pending_pings: HashMap::new(),
+            ping_seq: 1,
+            connections: HashMap::new(),
+            listeners: HashMap::new(),
+            next_conn_id: 1,
+            next_local_port,
+            udp_buf: vec![0; 65535],
+            wg_buf: vec![0; 65535],
+        })
+    }
+
+    async fn run(mut self, mut cmd_rx: mpsc::Receiver<NetworkCommand>, queued: Vec<NetworkCommand>) {
+        self.initiate_handshake().await;
+
+        for cmd in queued {
+            if let Flow::Shutdown(resp) = self.handle_command(cmd) {
+                self.shutdown(resp).await;
+                return;
+            }
+        }
+
+        let mut next_timer = tokio::time::Instant::now() + TIMER_INTERVAL;
+        loop {
+            self.poll_iface();
+            self.process_listeners();
+            self.process_connections();
+            self.process_icmp();
+            self.poll_iface();
+            self.flush_tx().await;
+            self.update_state();
+
+            let now = tokio::time::Instant::now();
+            if now >= next_timer {
+                self.on_timer().await;
+                next_timer = now + TIMER_INTERVAL;
+                continue;
+            }
+
+            let wake_at = match self.iface.poll_delay(smol_now(), &self.sockets) {
+                Some(d) => next_timer.min(now + Duration::from_micros(d.total_micros())),
+                None => next_timer,
+            };
+
+            let flow = tokio::select! {
+                biased;
+                cmd = cmd_rx.recv() => match cmd {
+                    None => Flow::Shutdown(None),
+                    Some(cmd) => {
+                        let mut flow = self.handle_command(cmd);
+                        for _ in 1..MAX_COMMANDS_PER_ITER {
+                            if !matches!(flow, Flow::Continue) {
+                                break;
+                            }
+                            match cmd_rx.try_recv() {
+                                Ok(cmd) => flow = self.handle_command(cmd),
+                                Err(_) => break,
+                            }
+                        }
+                        flow
+                    }
+                },
+                res = self.transport.recv(&mut self.udp_buf) => {
+                    match res {
+                        Ok(len) => {
+                            self.handle_datagram(len).await;
+                            // Drain any further datagrams that are already available,
+                            // so a burst is processed in one poll cycle (as UDP did).
+                            for _ in 1..MAX_DATAGRAMS_PER_ITER {
+                                match self.transport.try_recv(&mut self.udp_buf) {
+                                    Ok(len) => self.handle_datagram(len).await,
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(e) => debug!("[WG] transport recv error: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => debug!("[WG] transport recv error: {}", e),
+                    }
+                    Flow::Continue
+                },
+                _ = tokio::time::sleep_until(wake_at) => Flow::Continue,
+            };
+
+            if let Flow::Shutdown(resp) = flow {
+                self.shutdown(resp).await;
+                return;
+            }
+        }
+    }
+
+    // --- WireGuard / transport ---
+
+    async fn initiate_handshake(&mut self) {
+        if let TunnResult::WriteToNetwork(b) = self.tunn.format_handshake_initiation(&mut self.wg_buf, false) {
+            debug!("[WG] sending handshake initiation ({} bytes)", b.len());
+            if let Err(e) = self.transport.send(b).await {
+                warn!("[WG] failed to send handshake initiation: {}", e);
+            }
+        }
+    }
+
+    async fn handle_datagram(&mut self, len: usize) {
+        let mut first = true;
+        loop {
+            let input: &[u8] = if first { &self.udp_buf[..len] } else { &[] };
+            first = false;
+            match self.tunn.decapsulate(None, input, &mut self.wg_buf) {
+                TunnResult::WriteToNetwork(b) => {
+                    trace!("[WG] decapsulate -> network ({} bytes)", b.len());
+                    if let Err(e) = self.transport.send(b).await {
+                        debug!("[WG] transport send failed: {}", e);
+                    }
+                    // boringtun may have more queued packets: repeat with empty input.
+                }
+                TunnResult::WriteToTunnelV4(b, _) => {
+                    trace!("[WG] decapsulate -> tunnel ({} bytes)", b.len());
+                    self.device.push_rx(b);
+                    break;
+                }
+                TunnResult::WriteToTunnelV6(..) => {
+                    trace!("[WG] dropping IPv6 packet");
+                    break;
+                }
+                TunnResult::Done => break,
+                TunnResult::Err(e) => {
+                    debug!("[WG] decapsulate error: {:?}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Encrypt and send everything smoltcp has emitted.
+    async fn flush_tx(&mut self) {
+        while let Some(packet) = self.device.tx_queue.pop_front() {
+            match self.tunn.encapsulate(&packet, &mut self.wg_buf) {
+                TunnResult::WriteToNetwork(b) => {
+                    if let Err(e) = self.transport.send(b).await {
+                        debug!("[WG] transport send failed: {}", e);
+                    }
+                }
+                TunnResult::Err(e) => debug!("[WG] encapsulate error: {:?}", e),
+                _ => {}
+            }
+            self.device.recycle(packet);
+        }
+    }
+
+    async fn on_timer(&mut self) {
+        match self.tunn.update_timers(&mut self.wg_buf) {
+            TunnResult::WriteToNetwork(b) => {
+                trace!("[WG] timer packet ({} bytes)", b.len());
+                if let Err(e) = self.transport.send(b).await {
+                    debug!("[WG] transport send failed: {}", e);
+                }
+            }
+            TunnResult::Err(e) => {
+                // ConnectionExpired: boringtun exhausted handshake retries or the
+                // session aged out past REJECT_AFTER_TIME * 3 and cleared all keys.
+                // The WireGuard session is gone; reflect that in the watch state so
+                // `waitForDisconnect` resolves without waiting for the next poll.
+                debug!("[WG] session expired: {:?}", e);
+                self.update_state();
+            }
+            _ => {}
+        }
+
+        let expired: Vec<u16> = self
+            .pending_pings
+            .iter()
+            .filter(|(_, p)| p.started.elapsed() > PING_TIMEOUT)
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in expired {
+            if let Some(p) = self.pending_pings.remove(&seq) {
+                let _ = p.resp.send(Err(Error::from_reason("Ping timeout")));
+            }
+        }
+    }
+
+    fn update_state(&mut self) {
+        // The tunnel is only usable when the WireGuard session is established AND
+        // the underlying transport is connected. For UDP `is_connected()` is
+        // always true, so this is unchanged; for a WS server it drives the state
+        // Ready -> Connecting when the single peer connection drops (and back to
+        // Ready once a new peer connects and re-handshakes).
+        let ready = self.tunn.time_since_last_handshake().is_some() && self.transport.is_connected();
+        self.state_tx.send_if_modified(|state| match (ready, &*state) {
+            (true, TunnelState::Connecting) => {
+                info!("[WG] handshake complete");
+                *state = TunnelState::Ready;
+                true
+            }
+            (false, TunnelState::Ready) => {
+                debug!("[WG] session lost, waiting for new handshake");
+                *state = TunnelState::Connecting;
+                true
+            }
+            _ => false,
+        });
+    }
+
+    // --- smoltcp ---
+
+    /// Poll the interface. Ingress is processed one packet at a time so the
+    /// LISTEN backlog can be replenished between packets: a burst of concurrent
+    /// SYNs larger than `LISTEN_BACKLOG` is absorbed instead of being reset,
+    /// because a fresh LISTEN socket is armed before the next SYN is handled.
+    fn poll_iface(&mut self) {
+        let want_backlog = !self.listeners.is_empty();
+        for _ in 0..MAX_INGRESS_PACKETS {
+            match self.iface.poll_ingress_single(smol_now(), &mut self.device, &mut self.sockets) {
+                PollIngressSingleResult::None => break,
+                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::SocketStateChanged => {
+                    if want_backlog {
+                        self.ensure_listen_backlog();
+                    }
+                }
+            }
+        }
+        // Flush everything the sockets want to send.
+        for _ in 0..MAX_EGRESS_ROUNDS {
+            let before = self.device.tx_queue.len();
+            let res = self.iface.poll_egress(smol_now(), &mut self.device, &mut self.sockets);
+            if self.device.tx_queue.len() == before && matches!(res, PollResult::None) {
+                break;
+            }
+        }
+    }
+
+    /// Keep `LISTEN_BACKLOG` sockets in the LISTEN state for every listening
+    /// port. Sockets that advanced past LISTEN (SynReceived / Established) stay
+    /// in the pool until accepted in `process_listeners`; fresh LISTEN sockets
+    /// are added to refill, up to `MAX_LISTEN_POOL`. Established server sockets
+    /// keep the full-size buffers, so throughput is unaffected.
+    fn ensure_listen_backlog(&mut self) {
+        let source_ip = self.source_ip;
+        for (&port, listener) in self.listeners.iter_mut() {
+            let mut listening = 0usize;
+            for &handle in listener.pool.iter() {
+                let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+                match socket.state() {
+                    tcp::State::Listen => listening += 1,
+                    tcp::State::Closed | tcp::State::TimeWait => {
+                        // Aborted handshake: re-arm this slot in place.
+                        socket.abort();
+                        if socket.listen((IpAddress::Ipv4(source_ip), port)).is_ok() {
+                            listening += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            while listening < LISTEN_BACKLOG && listener.pool.len() < MAX_LISTEN_POOL {
+                let mut socket = new_tcp_socket();
+                if socket.listen((IpAddress::Ipv4(source_ip), port)).is_err() {
+                    break;
+                }
+                listener.pool.push(self.sockets.add(socket));
+                listening += 1;
+            }
+        }
+    }
+
+    fn alloc_local_port(&mut self) -> u16 {
+        let port = self.next_local_port;
+        self.next_local_port = if port == u16::MAX { EPHEMERAL_PORT_START } else { port + 1 };
+        port
+    }
+
+    fn process_listeners(&mut self) {
+        // Pull established sockets out of the listen pools.
+        let mut accepted: Vec<(u16, SocketHandle)> = Vec::new();
+        for (&port, listener) in self.listeners.iter_mut() {
+            let mut i = 0;
+            while i < listener.pool.len() {
+                let handle = listener.pool[i];
+                match self.sockets.get::<tcp::Socket>(handle).state() {
+                    // Still LISTEN, mid-handshake, or awaiting re-arm: keep in pool.
+                    tcp::State::Listen | tcp::State::SynReceived | tcp::State::Closed | tcp::State::TimeWait => {
+                        i += 1;
+                    }
+                    // Handshake completed: hand off as an accepted connection.
+                    _ => {
+                        accepted.push((port, handle));
+                        listener.pool.swap_remove(i);
+                    }
+                }
+            }
+        }
+
+        for (port, handle) in accepted {
+            let (remote_ip, remote_port) = match self.sockets.get::<tcp::Socket>(handle).remote_endpoint() {
+                Some(ep) => (ep.addr.to_string(), ep.port),
+                None => (String::from("unknown"), 0),
+            };
+
+            let Some(listener) = self.listeners.get(&port) else {
+                self.sockets.remove(handle);
+                continue;
+            };
+
+            let id = self.next_conn_id;
+            self.next_conn_id = self.next_conn_id.wrapping_add(1).max(1);
+            debug!("[LISTEN] accepted connection {} on port {} from {}:{}", id, port, remote_ip, remote_port);
+
+            let ctx = ConnectionContext::Server {
+                on_data: listener.on_data.clone(),
+                on_close: listener.on_close.clone(),
+            };
+            listener
+                .on_connection
+                .call(Ok((id, remote_ip, remote_port)), ThreadsafeFunctionCallMode::NonBlocking);
+            self.connections.insert(id, TcpConnection::new(handle, ctx, true));
+        }
+
+        // Refill the LISTEN backlog after removing accepted sockets.
+        self.ensure_listen_backlog();
+    }
+
+    fn process_connections(&mut self) {
+        let now = std::time::Instant::now();
+        let mut to_remove: Vec<u32> = Vec::new();
+
+        for (&id, conn) in self.connections.iter_mut() {
+            let socket = self.sockets.get_mut::<tcp::Socket>(conn.handle);
+
+            if !conn.established {
+                match socket.state() {
+                    tcp::State::SynSent => {
+                        if now >= conn.connect_deadline {
+                            socket.abort();
+                            if let Some(resp) = conn.connect_resp.take() {
+                                let _ = resp.send(Err(Error::from_reason("Connection timed out")));
+                            }
+                            conn.fail_pending("Connection timed out");
+                            to_remove.push(id);
+                        }
+                        continue;
+                    }
+                    tcp::State::Closed => {
+                        if let Some(resp) = conn.connect_resp.take() {
+                            let _ = resp.send(Err(Error::from_reason("Connection refused")));
+                        }
+                        conn.fail_pending("Connection refused");
+                        to_remove.push(id);
+                        continue;
+                    }
+                    state => {
+                        debug!("[CONNECT] connection {} established ({})", id, state);
+                        conn.established = true;
+                        if let Some(resp) = conn.connect_resp.take() {
+                            let _ = resp.send(Ok(id));
+                        }
+                    }
+                }
+            }
+
+            // While paused we leave the RX queue untouched so the TCP window
+            // closes and the peer throttles; buffered data is delivered on resume.
+            if !conn.paused && socket.can_recv() {
+                let data = drain_recv(socket);
+                if !data.is_empty() {
+                    trace!("[TCP] connection {} received {} bytes", id, data.len());
+                    conn.deliver_data(id, data);
+                }
+            }
+
+            conn.flush_pending(socket);
+
+            if conn.close_requested && !conn.fin_sent && conn.pending.is_empty() {
+                socket.close();
+                conn.fin_sent = true;
+            }
+
+            // Peer sent FIN (EOF) or connection reset/closed.
+            if !socket.may_recv() && !socket.can_recv() {
+                if conn.eof_at.is_none() {
+                    conn.eof_at = Some(now);
+                }
+                conn.signal_close(id);
+            }
+
+            if let Some(eof_at) = conn.eof_at {
+                if !conn.fin_sent && conn.pending.is_empty() && now.duration_since(eof_at) >= HALF_CLOSE_LINGER {
+                    debug!("[TCP] connection {} half-closed for too long, closing", id);
+                    socket.close();
+                    conn.fin_sent = true;
+                }
+            }
+
+            if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                conn.fail_pending("Connection closed");
+                conn.signal_close(id);
+                to_remove.push(id);
+            }
+        }
+
+        for id in to_remove {
+            if let Some(conn) = self.connections.remove(&id) {
+                self.sockets.remove(conn.handle);
+            }
+        }
+    }
+
+    fn process_icmp(&mut self) {
+        let caps = ChecksumCapabilities::default();
+        let socket = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
+        while socket.can_recv() {
+            let Ok((data, _)) = socket.recv() else { break };
+            let Ok(packet) = Icmpv4Packet::new_checked(data) else { continue };
+            if let Ok(Icmpv4Repr::EchoReply { ident, seq_no, .. }) = Icmpv4Repr::parse(&packet, &caps) {
+                if ident == ICMP_IDENT {
+                    if let Some(p) = self.pending_pings.remove(&seq_no) {
+                        let elapsed = p.started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                        let _ = p.resp.send(Ok(elapsed));
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Commands ---
+
+    fn handle_command(&mut self, cmd: NetworkCommand) -> Flow {
+        match cmd {
+            NetworkCommand::Connect { dest_ip, dest_port, on_data, on_close, resp } => {
+                self.cmd_connect(dest_ip, dest_port, ConnectionContext::Client { on_data, on_close }, resp);
+            }
+            NetworkCommand::SendData { connection_id, data, resp } => {
+                self.cmd_send(connection_id, data, resp);
+            }
+            NetworkCommand::Close { connection_id } => {
+                if let Some(conn) = self.connections.get_mut(&connection_id) {
+                    debug!("[TCP] close requested for connection {}", connection_id);
+                    conn.close_requested = true;
+                }
+            }
+            NetworkCommand::Pause { connection_id } => {
+                if let Some(conn) = self.connections.get_mut(&connection_id) {
+                    debug!("[TCP] pausing RX for connection {}", connection_id);
+                    conn.paused = true;
+                }
+            }
+            NetworkCommand::Resume { connection_id } => {
+                if let Some(conn) = self.connections.get_mut(&connection_id) {
+                    debug!("[TCP] resuming RX for connection {}", connection_id);
+                    conn.paused = false;
+                }
+            }
+            NetworkCommand::Listen { port, on_connection, on_data, on_close, resp } => {
+                let res = self.cmd_listen(port, on_connection, on_data, on_close);
+                let _ = resp.send(res);
+            }
+            NetworkCommand::Ping { dest_ip, resp } => self.cmd_ping(dest_ip, resp),
+            NetworkCommand::Shutdown { resp } => return Flow::Shutdown(Some(resp)),
+        }
+        Flow::Continue
+    }
+
+    fn cmd_connect(
+        &mut self,
+        dest_ip: Ipv4Address,
+        dest_port: u16,
+        ctx: ConnectionContext,
+        resp: oneshot::Sender<Result<u32>>,
+    ) {
+        let mut socket = new_tcp_socket();
+        let local_port = self.alloc_local_port();
+        let remote = (IpAddress::Ipv4(dest_ip), dest_port);
+        let local = (IpAddress::Ipv4(self.source_ip), local_port);
+        debug!("[CONNECT] {}:{} from local port {}", dest_ip, dest_port, local_port);
+
+        if let Err(e) = socket.connect(self.iface.context(), remote, local) {
+            let _ = resp.send(Err(Error::from_reason(format!("Connect error: {:?}", e))));
+            return;
+        }
+
+        let handle = self.sockets.add(socket);
+        let id = self.next_conn_id;
+        self.next_conn_id = self.next_conn_id.wrapping_add(1).max(1);
+        let mut conn = TcpConnection::new(handle, ctx, false);
+        conn.connect_resp = Some(resp);
+        self.connections.insert(id, conn);
+    }
+
+    fn cmd_send(&mut self, connection_id: u32, data: Vec<u8>, resp: oneshot::Sender<Result<()>>) {
+        let Some(conn) = self.connections.get_mut(&connection_id) else {
+            let _ = resp.send(Err(Error::from_reason(format!("Connection {} not found", connection_id))));
+            return;
+        };
+        if conn.close_requested || conn.fin_sent {
+            let _ = resp.send(Err(Error::from_reason("Connection is closing")));
+            return;
+        }
+        if data.is_empty() {
+            let _ = resp.send(Ok(()));
+            return;
+        }
+        trace!("[TCP] connection {} queueing {} bytes", connection_id, data.len());
+        conn.pending.push_back(PendingSend { data, offset: 0, resp });
+        let socket = self.sockets.get_mut::<tcp::Socket>(conn.handle);
+        conn.flush_pending(socket);
+    }
+
+    fn cmd_listen(
+        &mut self,
+        port: u16,
+        on_connection: ThreadsafeFunction<(u32, String, u16)>,
+        on_data: ThreadsafeFunction<(u32, Buffer)>,
+        on_close: ThreadsafeFunction<u32>,
+    ) -> Result<()> {
+        if port == 0 {
+            return Err(Error::from_reason("Listen failed: port must not be 0"));
+        }
+        if self.listeners.contains_key(&port) {
+            return Err(Error::from_reason(format!("Listen failed: port {} is already in use", port)));
+        }
+
+        let mut pool = Vec::with_capacity(LISTEN_BACKLOG);
+        for _ in 0..LISTEN_BACKLOG {
+            let mut socket = new_tcp_socket();
+            if let Err(e) = socket.listen((IpAddress::Ipv4(self.source_ip), port)) {
+                for handle in pool {
+                    self.sockets.remove(handle);
+                }
+                return Err(Error::from_reason(format!("Listen failed: {:?}", e)));
+            }
+            pool.push(self.sockets.add(socket));
+        }
+
+        info!("[LISTEN] listening on {}:{}", self.source_ip, port);
+        self.listeners.insert(
+            port,
+            Listener {
+                on_connection,
+                on_data,
+                on_close,
+                pool,
+            },
+        );
+        Ok(())
+    }
+
+    fn cmd_ping(&mut self, dest_ip: Ipv4Address, resp: oneshot::Sender<Result<u32>>) {
+        let seq = self.ping_seq;
+        self.ping_seq = self.ping_seq.wrapping_add(1);
+
+        let repr = Icmpv4Repr::EchoRequest {
+            ident: ICMP_IDENT,
+            seq_no: seq,
+            data: b"PING",
+        };
+        let socket = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
+        if !socket.can_send() {
+            let _ = resp.send(Err(Error::from_reason("ICMP socket cannot send")));
+            return;
+        }
+        match socket.send(repr.buffer_len(), IpAddress::Ipv4(dest_ip)) {
+            Ok(buf) => {
+                let mut packet = Icmpv4Packet::new_unchecked(buf);
+                repr.emit(&mut packet, &ChecksumCapabilities::default());
+                debug!("[PING] echo request seq={} to {}", seq, dest_ip);
+                self.pending_pings.insert(
+                    seq,
+                    PendingPing {
+                        resp,
+                        started: std::time::Instant::now(),
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = resp.send(Err(Error::from_reason(format!("ICMP send failed: {:?}", e))));
+            }
+        }
+    }
+
+    // --- Shutdown ---
+
+    async fn shutdown(mut self, resp: Option<oneshot::Sender<()>>) {
+        info!("[WG] shutting down");
+        for (id, mut conn) in self.connections.drain() {
+            let socket = self.sockets.get_mut::<tcp::Socket>(conn.handle);
+            socket.abort();
+            if let Some(r) = conn.connect_resp.take() {
+                let _ = r.send(Err(Error::from_reason("WireShade has been shut down")));
+            }
+            conn.fail_pending("WireShade has been shut down");
+            if conn.established {
+                conn.signal_close(id);
+            }
+        }
+        for (_, listener) in self.listeners.drain() {
+            for handle in listener.pool {
+                self.sockets.get_mut::<tcp::Socket>(handle).abort();
+            }
+        }
+        for (_, p) in self.pending_pings.drain() {
+            let _ = p.resp.send(Err(Error::from_reason("WireShade has been shut down")));
+        }
+
+        // Emit the RSTs so peers don't keep half-open connections.
+        self.poll_iface();
+        self.flush_tx().await;
+        self.transport.close().await;
+
+        self.state_tx.send_replace(TunnelState::Closed);
+        if let Some(resp) = resp {
+            let _ = resp.send(());
+        }
+    }
+}
+
+/// Entry point of the network task: async transport setup, then the engine loop.
+async fn run_task(
+    tunn: Tunn,
+    transport_cfg: TransportConfig,
+    source_ip: Ipv4Address,
+    mut cmd_rx: mpsc::Receiver<NetworkCommand>,
+    state_tx: watch::Sender<TunnelState>,
+) {
+    // Commands arriving during setup are queued and processed afterwards.
+    let mut queued: Vec<NetworkCommand> = Vec::new();
+    let setup = setup_transport(transport_cfg);
+    tokio::pin!(setup);
+
+    let transport = loop {
+        tokio::select! {
+            res = &mut setup => break res,
+            cmd = cmd_rx.recv() => match cmd {
+                None => {
+                    state_tx.send_replace(TunnelState::Closed);
+                    return;
+                }
+                Some(NetworkCommand::Shutdown { resp }) => {
+                    for cmd in queued {
+                        cmd.reject("WireShade has been shut down");
+                    }
+                    state_tx.send_replace(TunnelState::Closed);
+                    let _ = resp.send(());
+                    return;
+                }
+                Some(cmd) => queued.push(cmd),
+            },
+        }
+    };
+
+    let engine = transport.and_then(|t| Engine::new(tunn, t, source_ip, state_tx.clone()));
+    match engine {
+        Ok(engine) => engine.run(cmd_rx, queued).await,
+        Err(msg) => {
+            error!("[WG] setup failed: {}", msg);
+            for cmd in queued {
+                cmd.reject(&msg);
+            }
+            state_tx.send_replace(TunnelState::Failed(msg));
+        }
+    }
+}
+
+// --- JS-facing API ---
+
+/// Shared handle to the network task.
+#[derive(Clone)]
+struct TaskHandle {
+    cmd_tx: mpsc::Sender<NetworkCommand>,
+    state_rx: watch::Receiver<TunnelState>,
+}
+
+impl TaskHandle {
+    /// Error used when the network task is no longer running.
+    fn gone(&self) -> Error {
+        match &*self.state_rx.borrow() {
+            TunnelState::Failed(msg) => Error::from_reason(format!("WireShade setup failed: {}", msg)),
+            _ => Error::from_reason("WireShade has been shut down"),
+        }
+    }
+
+    async fn send(&self, cmd: NetworkCommand) -> Result<()> {
+        self.cmd_tx.send(cmd).await.map_err(|_| self.gone())
+    }
+
+    async fn request<T>(&self, cmd: NetworkCommand, rx: oneshot::Receiver<Result<T>>) -> Result<T> {
+        self.send(cmd).await?;
+        rx.await.map_err(|_| self.gone())?
+    }
+
+    async fn send_data(&self, connection_id: u32, data: Buffer) -> Result<()> {
+        let (resp, rx) = oneshot::channel();
+        let data: Vec<u8> = data.into();
+        self.request(NetworkCommand::SendData { connection_id, data, resp }, rx).await
+    }
+
+    async fn close(&self, connection_id: u32) -> Result<()> {
+        self.send(NetworkCommand::Close { connection_id }).await
+    }
+
+    async fn pause(&self, connection_id: u32) -> Result<()> {
+        // Best effort: an unknown/closed id or an already-gone task is a no-op.
+        let _ = self.send(NetworkCommand::Pause { connection_id }).await;
+        Ok(())
+    }
+
+    async fn resume(&self, connection_id: u32) -> Result<()> {
+        // Best effort: an unknown/closed id or an already-gone task is a no-op.
+        let _ = self.send(NetworkCommand::Resume { connection_id }).await;
+        Ok(())
+    }
+}
+
+/// Userspace WireGuard tunnel with an embedded TCP/IP stack.
 #[napi]
 pub struct WireShade {
-    cmd_tx: mpsc::Sender<NetworkCommand>,
+    handle: TaskHandle,
+}
+
+/// Build a boringtun `Tunn` from base64 key material and a parsed source IP.
+/// Shared by every transport factory. `persistentKeepalive` is in seconds
+/// (0 / omitted = disabled); the default is unchanged from the UDP path.
+fn build_tunnel(
+    private_key: &str,
+    peer_public_key: &str,
+    preshared_key: Option<&str>,
+    source_ip: &str,
+    persistent_keepalive: Option<u16>,
+) -> Result<(Tunn, Ipv4Address)> {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).try_init();
+
+    let private_key_bytes = decode_key(private_key).map_err(|e| Error::from_reason(format!("Invalid private key: {}", e)))?;
+    let peer_key_bytes = decode_key(peer_public_key).map_err(|e| Error::from_reason(format!("Invalid peer public key: {}", e)))?;
+    let psk_bytes = match preshared_key {
+        Some(psk) if !psk.is_empty() => {
+            Some(decode_key(psk).map_err(|e| Error::from_reason(format!("Invalid preshared key: {}", e)))?)
+        }
+        _ => None,
+    };
+    let source_ip_addr = Ipv4Address::from_str(source_ip).map_err(|_| Error::from_reason(format!("Invalid source IP: {}", source_ip)))?;
+    let keepalive = persistent_keepalive.filter(|&k| k > 0);
+
+    let tunn = Tunn::new(private_key_bytes.into(), peer_key_bytes.into(), psk_bytes, keepalive, 0, None)
+        .map_err(|e| Error::from_reason(format!("Failed to create WireGuard tunnel: {}", e)))?;
+    Ok((tunn, source_ip_addr))
 }
 
 #[napi]
 impl WireShade {
+    /// Spawn the network task for a chosen transport and return the handle.
+    fn spawn(tunn: Tunn, source_ip: Ipv4Address, transport_cfg: TransportConfig) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (state_tx, state_rx) = watch::channel(TunnelState::Connecting);
+        napi::bindgen_prelude::spawn(run_task(tunn, transport_cfg, source_ip, cmd_rx, state_tx));
+        Self {
+            handle: TaskHandle { cmd_tx, state_rx },
+        }
+    }
+
+    /// Create the tunnel over UDP (today's behavior). Throws only on invalid
+    /// keys / source IP; endpoint DNS resolution and the UDP bind happen
+    /// asynchronously (see `waitForHandshake`). `persistentKeepalive` is in
+    /// seconds (0 / omitted = disabled).
+    ///
+    /// This positional constructor is kept as-is so the high-level JS API
+    /// (`new WireShade(...)`) keeps working; `WireShade.overUdp(...)` is an
+    /// alias with identical behavior.
     #[napi(constructor)]
     pub fn new(
         private_key: String,
@@ -169,788 +1256,310 @@ impl WireShade {
         endpoint: String,
         source_ip: String,
         listen_port: Option<u16>,
+        persistent_keepalive: Option<u16>,
     ) -> Result<Self> {
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
-
-        let private_key_bytes = decode_key(&private_key).map_err(|e| Error::from_reason(format!("Invalid private key: {}", e)))?;
-        let peer_key_bytes = decode_key(&peer_public_key).map_err(|e| Error::from_reason(format!("Invalid peer key: {}", e)))?;
-        let psk_bytes = if let Some(psk) = preshared_key {
-            Some(decode_key(&psk).map_err(|e| Error::from_reason(format!("Invalid psk: {}", e)))?)
-        } else {
-            None
-        };
-
-        let source_ip_addr = Ipv4Address::from_str(&source_ip).map_err(|_| Error::from_reason("Invalid source IP"))?;
-        
-        eprintln!("Resolving endpoint: {}", endpoint);
-        let endpoint_addr = endpoint.to_socket_addrs().map_err(|e| Error::from_reason(format!("Invalid endpoint: {}", e)))?
-            .next().ok_or_else(|| Error::from_reason("Endpoint did not resolve"))?;
-        eprintln!("Resolved to: {}", endpoint_addr);
-
-        tokio::spawn(async move {
-            let mut tunn = Tunn::new(
-                private_key_bytes.into(),
-                peer_key_bytes.into(),
-                psk_bytes,
-                None, 
-                0, 
-                None 
-            ).expect("Failed to create Tunn");
-
-            let bind_addr = format!("0.0.0.0:{}", listen_port.unwrap_or(0));
-            let udp_socket = UdpSocket::bind(&bind_addr).await.expect("Failed to bind UDP");
-            let local_addr = udp_socket.local_addr().expect("Failed to get local addr");
-            udp_socket.connect(endpoint_addr).await.expect("Failed to connect UDP");
-            eprintln!("UDP bound to {} and connected to {}", local_addr, endpoint_addr);
-
-            let mut device = VirtualDevice::new(1420); 
-            
-            let mut socket_set_entries: [SocketStorage; 32] = Default::default();
-            let mut socket_set = SocketSet::new(&mut socket_set_entries[..]);
-            
-            // Configure interface for IP medium - exactly like river
-            let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
-            // Randomize seed for ISN generation
-            use std::time::{SystemTime, UNIX_EPOCH};
-            config.random_seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
-            
-            // Use /32 with .into() exactly like river does
-            let mut iface = Interface::new(config, &mut device, Instant::now());
-            iface.update_ip_addrs(|ip_addrs| {
-                ip_addrs.push(smoltcp::wire::Ipv4Cidr::new(source_ip_addr, 32).into()).ok();
-            });
-
-            // NO routes - exactly like river
-            eprintln!("Interface configured: {}/32 (exactly like river)", source_ip_addr);
-            let _ = std::io::stderr().flush();
-
-            let icmp_rx_buffer = smoltcp::socket::icmp::PacketBuffer::new(
-                vec![smoltcp::socket::icmp::PacketMetadata::EMPTY; 16],
-                vec![0; 1024]
-            );
-            let icmp_tx_buffer = smoltcp::socket::icmp::PacketBuffer::new(
-                vec![smoltcp::socket::icmp::PacketMetadata::EMPTY; 16],
-                vec![0; 1024]
-            );
-            let mut icmp_socket = smoltcp::socket::icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-            icmp_socket.bind(smoltcp::socket::icmp::Endpoint::Ident(0x1234)).expect("failed to bind ICMP");
-            let icmp_handle = socket_set.add(icmp_socket);
-            let mut pending_pings: HashMap<u16, (oneshot::Sender<Result<u32>>, std::time::Instant)> = HashMap::new();
-            let mut ping_seq = 1u16;
-
-            let mut connections: HashMap<u32, (smoltcp::iface::SocketHandle, ConnectionContext)> = HashMap::new();
-            let mut listeners: HashMap<u16, ListenerInfo> = HashMap::new();
-            let mut listening_sockets: HashMap<u16, smoltcp::iface::SocketHandle> = HashMap::new();
-            // Buffer for pending data when socket can't send yet (e.g., during TCP handshake)
-            let mut pending_data: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
-            let mut next_conn_id = 1u32;
-            
-            // Randomize start port
-            let start = SystemTime::now();
-            let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap();
-            let mut next_local_port = ((since_the_epoch.as_millis() % 16383) + 49152) as u16; 
-            eprintln!("[INIT] Starting with ephemeral port: {}", next_local_port);
-
-            let mut buf = [0u8; 65535]; 
-            let mut dst_buf = [0u8; 65535]; 
-            
-            // CRITICAL: Initiate WireGuard handshake IMMEDIATELY
-            eprintln!("[WG] Initiating handshake...");
-            let _ = std::io::stderr().flush();
-            match tunn.format_handshake_initiation(&mut dst_buf, false) {
-                TunnResult::WriteToNetwork(b) => {
-                    let res = udp_socket.send(b).await;
-                    eprintln!("[WG] Handshake initiation sent ({} bytes). Result: {:?}", b.len(), res);
-                }
-                other => {
-                    eprintln!("[WG] Unexpected handshake init result: {:?}", other);
-                }
-            }
-            let _ = std::io::stderr().flush();
-            
-            // Wait for handshake response and complete the handshake
-            let mut handshake_complete = false;
-            let handshake_timeout = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-            
-            while !handshake_complete && tokio::time::Instant::now() < handshake_timeout {
-                tokio::select! {
-                    res = udp_socket.recv(&mut buf) => {
-                        if let Ok(len) = res {
-                            eprintln!("[WG] Handshake: Received {} bytes", len);
-                            match tunn.decapsulate(None, &buf[..len], &mut dst_buf) {
-                                TunnResult::WriteToNetwork(b) => {
-                                    let res = udp_socket.send(b).await;
-                                    eprintln!("[WG] Handshake: Sent reply ({} bytes). Result: {:?}", b.len(), res);
-                                    
-                                    // After sending, check if more packets need to go out
-                                    loop {
-                                        let mut extra_buf = [0u8; 65535];
-                                        match tunn.decapsulate(None, &[], &mut extra_buf) {
-                                            TunnResult::WriteToNetwork(b2) => {
-                                                let res2 = udp_socket.send(b2).await;
-                                                eprintln!("[WG] Handshake: Follow-up ({} bytes). Result: {:?}", b2.len(), res2);
-                                            }
-                                            TunnResult::Done => {
-                                                eprintln!("[WG] *** HANDSHAKE COMPLETE! ***");
-                                                handshake_complete = true;
-                                                break;
-                                            }
-                                            _ => break,
-                                        }
-                                    }
-                                }
-                                TunnResult::Done => {
-                                    // Check if we can now send data
-                                    eprintln!("[WG] Handshake: Done received, testing if session active...");
-                                    // Try to encapsulate a small packet to see if session is active
-                                    let test_packet = [0u8; 20]; // minimal IP header
-                                    match tunn.encapsulate(&test_packet, &mut dst_buf) {
-                                        TunnResult::WriteToNetwork(_) => {
-                                            eprintln!("[WG] *** SESSION ACTIVE! ***");
-                                            handshake_complete = true;
-                                        }
-                                        _ => {
-                                            eprintln!("[WG] Session not yet active, continuing handshake...");
-                                        }
-                                    }
-                                }
-                                other => {
-                                    eprintln!("[WG] Handshake: Other result: {:?}", other);
-                                }
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                        // Check timers
-                        match tunn.update_timers(&mut dst_buf) {
-                            TunnResult::WriteToNetwork(b) => {
-                                let res = udp_socket.send(b).await;
-                                eprintln!("[WG] Handshake: Timer packet ({} bytes). Result: {:?}", b.len(), res);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            
-            if !handshake_complete {
-                eprintln!("[WG] WARNING: Handshake may not be complete after timeout!");
-            }
-
-            let mut heartbeat_timer = tokio::time::interval(tokio::time::Duration::from_secs(5));
-
-            loop {
-                let timestamp = Instant::now();
-                iface.poll(timestamp, &mut device, &mut socket_set);
-
-                tokio::select! {
-                    _ = heartbeat_timer.tick() => {
-                        // FORCE HANDSHAKE by sending a dummy packet if no activity
-                        // We send a dummy UDP packet to 10.245.1.1:9 (Discard)
-                        let mut ip_bytes = vec![0u8; 20 + 8 + 4];
-                        let mut ip_packet = Ipv4Packet::new_unchecked(&mut ip_bytes);
-                        ip_packet.set_version(4);
-                        ip_packet.set_header_len(20);
-                        ip_packet.set_total_len(32);
-                        ip_packet.set_next_header(IpProtocol::Udp);
-                        ip_packet.set_src_addr(source_ip_addr);
-                        ip_packet.set_dst_addr(Ipv4Address::new(10, 245, 1, 1));
-                        ip_packet.set_hop_limit(64);
-                        ip_packet.fill_checksum();
-
-                        match tunn.encapsulate(ip_packet.into_inner(), &mut dst_buf) {
-                            TunnResult::WriteToNetwork(b) => {
-                                let res = udp_socket.send(b).await;
-                                eprintln!("[WG] Periodic heartbeat/handshake trigger sent ({} bytes). UDP Send result: {:?}", b.len(), res);
-                                let _ = std::io::stderr().flush();
-                            }
-                            _ => {}
-                        }
-                    }
-                    cmd_res = cmd_rx.recv() => {
-                        if let Some(cmd) = cmd_res {
-                             match cmd {
-                                NetworkCommand::Connect { dest_ip, dest_port, on_data, on_close, resp } => {
-                                    eprintln!("Command Connect to {}:{}", dest_ip, dest_port);
-
-                                    // Debug Routing
-                                    eprintln!(" -- Routing Info --");
-                                    for c in iface.ip_addrs() {
-                                        eprintln!("  IF IP: {:?}", c);
-                                    }
-                                    let _ = std::io::stderr().flush();
-
-                                    let rx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
-                                    let tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
-                                    let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-
-                                    eprintln!("[CONNECT] Attempting {}:{}", dest_ip, dest_port);
-                                    let remote_endpoint = (IpAddress::Ipv4(dest_ip), dest_port);
-
-                                    // Use a real ephemeral port - smoltcp REQUIRES non-zero port!
-                                    let local_port = next_local_port;
-                                    next_local_port = next_local_port.wrapping_add(1);
-                                    if next_local_port < 49152 { next_local_port = 49152; }
-
-                                    let local_endpoint = (IpAddress::Ipv4(source_ip_addr), local_port);
-
-                                    eprintln!("[CONNECT] remote={:?}, local={:?}", remote_endpoint, local_endpoint);
-                                    let _ = std::io::stderr().flush();
-
-                                    match socket.connect(iface.context(), remote_endpoint, local_endpoint) {
-                                        Ok(_) => {
-                                            eprintln!("Connect initiated! Socket state: {:?}", socket.state());
-
-                                            // Add the connected socket to the socket_set
-                                            let handle = socket_set.add(socket);
-
-                                            let id = next_conn_id;
-                                            next_conn_id += 1;
-                                            connections.insert(id, (handle, ConnectionContext::Client { on_data, on_close }));
-
-                                            // CRITICAL: Resolve immediately! 
-                                            // JavaScript can start queueing data, and we'll send it when socket is ready
-                                            eprintln!("[CONNECT] Resolving promise immediately for connection {}", id);
-                                            let _ = resp.send(Ok(id));
-
-                                            iface.poll(Instant::now(), &mut device, &mut socket_set);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Connect failed: {:?}", e);
-                                            // Socket is not in socket_set yet, so no need to remove
-                                            let _ = resp.send(Err(Error::from_reason(format!("Connect error: {:?}", e))));
-                                        }
-                                    }
-                                },
-                                NetworkCommand::SendData { connection_id, data } => {
-                                    eprintln!("[SEND] Sending {} bytes to connection {}", data.len(), connection_id);
-                                    if let Some((handle, _)) = connections.get(&connection_id) {
-                                        let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-                                        eprintln!("[SEND] Socket state: {:?}, can_send: {}", socket.state(), socket.can_send());
-                                        if socket.can_send() {
-                                            match socket.send_slice(&data) {
-                                                Ok(sent) => {
-                                                    eprintln!("[SEND] Queued {} bytes in TCP socket", sent);
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("[SEND] Error: {:?}", e);
-                                                }
-                                            }
-                                            // CRITICAL: Poll to generate the TCP packet
-                                            iface.poll(Instant::now(), &mut device, &mut socket_set);
-
-                                            // Send any generated packets through WireGuard
-                                            while let Some(packet) = device.tx_queue.pop_front() {
-                                                match tunn.encapsulate(&packet, &mut dst_buf) {
-                                                    TunnResult::WriteToNetwork(b) => {
-                                                        let _ = udp_socket.try_send(b);
-                                                        eprintln!("[SEND] Sent {} bytes through WireGuard", b.len());
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        } else {
-                                            eprintln!("[SEND] Socket cannot send right now - state: {:?}. Buffering data.", socket.state());
-                                            // Buffer the data for later
-                                            pending_data.entry(connection_id).or_default().push(data);
-                                        }
-                                    } else {
-                                        eprintln!("[SEND] Connection {} not found", connection_id);
-                                    }
-                                },
-                                NetworkCommand::Close { connection_id } => {
-                                     if let Some((handle, _)) = connections.get(&connection_id) {
-                                        let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-                                        socket.close();
-                                     }
-                                }
-                                NetworkCommand::Listen { port, on_connection, on_data, on_close, resp } => {
-                                    eprintln!("[LISTEN] Request on port {}", port);
-                                    
-                                    // Store listener info for spawning future sockets
-                                    listeners.insert(port, ListenerInfo { 
-                                        port, 
-                                        on_connection, 
-                                        on_data: on_data, // clone needed? TF is cloneable
-                                        on_close: on_close 
-                                    });
-
-                                    // Create first listening socket
-                                    let rx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
-                                    let tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
-                                    let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-
-                                    let local_endpoint = (IpAddress::Ipv4(source_ip_addr), port);
-                                    match socket.listen(local_endpoint) {
-                                        Ok(_) => {
-                                            let handle = socket_set.add(socket);
-                                            listening_sockets.insert(port, handle);
-                                            let _ = resp.send(Ok(()));
-                                            eprintln!("[LISTEN] Socket listening on port {}", port);
-                                        },
-                                        Err(e) => {
-                                            eprintln!("[LISTEN] Failed to listen: {:?}", e);
-                                            let _ = resp.send(Err(Error::from_reason(format!("Listen failed: {:?}", e))));
-                                        }
-                                    }
-                                }
-                                NetworkCommand::Ping { dest_ip, resp } => {
-                                    eprintln!("[PING] Request to {}", dest_ip);
-                                    let socket = socket_set.get_mut::<smoltcp::socket::icmp::Socket>(icmp_handle);
-                                    
-                                    let seq = ping_seq;
-                                    ping_seq = ping_seq.wrapping_add(1);
-                                    
-                                    let mut packet = vec![0u8; 8 + 4]; // 8 bytes header + 4 bytes payload
-                                    packet[0] = 8; // Type: Echo Request
-                                    packet[1] = 0; // Code: 0
-                                    packet[4] = 0x12; // Ident high
-                                    packet[5] = 0x34; // Ident low
-                                    packet[6] = (seq >> 8) as u8;
-                                    packet[7] = (seq & 0xff) as u8;
-                                    packet[8..12].copy_from_slice(b"PING");
-
-                                    // Calculate checksum
-                                    let mut sum = 0u32;
-                                    for chunk in packet.chunks(2) {
-                                        let word = if chunk.len() == 2 {
-                                            ((chunk[0] as u32) << 8) | (chunk[1] as u32)
-                                        } else {
-                                            (chunk[0] as u32) << 8
-                                        };
-                                        sum = sum.wrapping_add(word);
-                                    }
-                                    while (sum >> 16) > 0 {
-                                        sum = (sum & 0xffff) + (sum >> 16);
-                                    }
-                                    let csum = !sum as u16;
-                                    packet[2] = (csum >> 8) as u8;
-                                    packet[3] = (csum & 0xff) as u8;
-
-                                    if socket.can_send() {
-                                        match socket.send(packet.len(), IpAddress::Ipv4(dest_ip)) {
-                                            Ok(buf) => {
-                                                buf.copy_from_slice(&packet);
-                                                pending_pings.insert(seq, (resp, std::time::Instant::now()));
-                                            }
-                                            Err(e) => {
-                                                let _ = resp.send(Err(Error::from_reason(format!("ICMP send failed: {:?}", e))));
-                                            }
-                                        }
-                                        iface.poll(Instant::now(), &mut device, &mut socket_set);
-                                    } else {
-                                        let _ = resp.send(Err(Error::from_reason("ICMP socket cannot send")));
-                                    }
-                                }
-                             }
-                        }
-                    }
-                    res = udp_socket.recv(&mut buf) => {
-                         match res {
-                            Ok(len) => {
-                                 // WireGuard packet types: 1=Initiation, 2=Response, 3=CookieReply, 4=Data
-                                 let pkt_type = if len >= 4 { buf[0] } else { 0 };
-                                 let type_name = match pkt_type {
-                                     1 => "Initiation",
-                                     2 => "Response",
-                                     3 => "CookieReply",
-                                     4 => "Data",
-                                     _ => "Unknown"
-                                 };
-                                 // eprintln!("[WG] Received {} bytes from UDP (type={} {})", len, pkt_type, type_name);
-                                 let _ = std::io::stderr().flush();
-
-                                 // First decapsulate with the received data
-                                 match tunn.decapsulate(None, &buf[..len], &mut dst_buf) {
-                                    TunnResult::WriteToNetwork(b) => {
-                                         let res = udp_socket.send(b).await;
-                                         eprintln!("[WG] Decap triggered reply ({} bytes). Send result: {:?}", b.len(), res);
-                                         let _ = std::io::stderr().flush();
-
-                                         // CRITICAL: After WriteToNetwork, boringtun may have more packets!
-                                         // We need to loop with empty input to drain pending handshake packets.
-                                         loop {
-                                             let mut extra_buf = [0u8; 65535];
-                                             match tunn.decapsulate(None, &[], &mut extra_buf) {
-                                                 TunnResult::WriteToNetwork(b2) => {
-                                                     let res2 = udp_socket.send(b2).await;
-                                                     eprintln!("[WG] Decap follow-up packet ({} bytes). Send result: {:?}", b2.len(), res2);
-                                                 }
-                                                 TunnResult::Done => {
-                                                     eprintln!("[WG] Handshake sequence complete!");
-                                                     break;
-                                                 }
-                                                 _ => break,
-                                             }
-                                         }
-                                    }
-                                    TunnResult::WriteToTunnelV4(b, _) => {
-                                        // Simple manual inspection of TCP flags to debug handshake
-                                        if b.len() > 20 && b[9] == 6 { // IPv4 & TCP
-                                            let ihl = (b[0] & 0x0F) * 4;
-                                            if b.len() >= (ihl as usize + 14) {
-                                                let tcp_flags = b[ihl as usize + 13];
-                                                let is_syn = tcp_flags & 0x02 != 0;
-                                                let is_ack = tcp_flags & 0x10 != 0;
-                                                let is_rst = tcp_flags & 0x04 != 0;
-                                                let is_fin = tcp_flags & 0x01 != 0;
-                                                let is_psh = tcp_flags & 0x08 != 0;
-                                                /*
-                                                eprintln!("[WG] Decapped IPv4 TCP ({} bytes). Flags: [{} {} {} {} {}]",
-                                                    b.len(),
-                                                    if is_syn { "SYN" } else { "-" },
-                                                    if is_ack { "ACK" } else { "-" },
-                                                    if is_rst { "RST" } else { "-" },
-                                                    if is_fin { "FIN" } else { "-" },
-                                                    if is_psh { "PSH" } else { "-" }
-                                                );
-                                                */
-                                            }
-                                        } else {
-                                            // eprintln!("[WG] Decapped IPv4 DATA ({} bytes)", b.len());
-                                        }
-
-                                        device.rx_queue.push_back(b.to_vec());
-
-                                        // CRITICAL: Immediately poll so smoltcp processes the packet
-                                        iface.poll(Instant::now(), &mut device, &mut socket_set);
-
-                                        // Check if any connections can now send buffered data
-                                        for (id, (handle, _)) in connections.iter() {
-                                            let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-                                            // eprintln!("[DEBUG] Socket {} state after poll: {:?}, can_send: {}", id, socket.state(), socket.can_send());
-                                            
-                                            if socket.can_send() {
-                                                if let Some(buffers) = pending_data.get_mut(id) {
-                                                    if !buffers.is_empty() {
-                                                        // eprintln!("[SEND] Flushing {} buffered chunks for connection {}", buffers.len(), id);
-                                                        for data in buffers.drain(..) {
-                                                            match socket.send_slice(&data) {
-                                                                Ok(sent) => {
-                                                                    // eprintln!("[SEND] Flushed {} bytes to TCP socket", sent);
-                                                                }
-                                                                Err(e) => {
-                                                                    eprintln!("[SEND] Flush error: {:?}", e);
-                                                                }
-                                                            }
-                                                        }
-                                                        // Poll again to generate packets
-                                                        iface.poll(Instant::now(), &mut device, &mut socket_set);
-                                                        
-                                                        // Send generated packets through WireGuard
-                                                        while let Some(packet) = device.tx_queue.pop_front() {
-                                                            match tunn.encapsulate(&packet, &mut dst_buf) {
-                                                                TunnResult::WriteToNetwork(b2) => {
-                                                                    let _ = udp_socket.try_send(b2);
-                                                                    // eprintln!("[SEND] Flushed {} bytes through WireGuard", b2.len());
-                                                                }
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    TunnResult::Done => {
-                                         eprintln!("[WG] Decap: Done (no action needed)");
-                                    }
-                                    TunnResult::Err(e) => {
-                                         eprintln!("[WG] Decap error: {:?}", e);
-                                    }
-                                    _ => {
-                                         eprintln!("[WG] Decap result: Other (WriteToTunnelV6?)");
-                                    }
-                                 }
-                            }
-                             Err(e) => {
-                                 eprintln!("UDP Recv Error: {:?}", e);
-                             }
-                         }
-                    }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {}
-                }
-                // Process Device Tx -> WireGuard
-                while let Some(packet) = device.tx_queue.pop_front() {
-                     match tunn.encapsulate(&packet, &mut dst_buf) {
-                        TunnResult::WriteToNetwork(b) => {
-                             let res = udp_socket.send(b).await;
-                             // eprintln!("[WG] Encap sent packet ({} bytes). Send result: {:?}", b.len(), res);
-                        }
-                        _ => {}
-                     }
-                }
-                
-                match tunn.update_timers(&mut dst_buf) {
-                     TunnResult::WriteToNetwork(b) => {
-                          let res = udp_socket.send(b).await;
-                          eprintln!("[WG] Timer handshake/keepalive ({} bytes). Send result: {:?}", b.len(), res);
-                     }
-                     _ => {}
-                }
-
-                let mut to_remove = Vec::new();
-                for (id, (handle, ctx)) in connections.iter() {
-                     let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-                     if socket.can_recv() {
-                         let recv_len = socket.recv_queue(); // Avoid potential issues with empty queue alloc
-                         if recv_len > 0 {
-                             let mut data = vec![0; recv_len];
-                             if let Ok(len) = socket.recv_slice(&mut data) {
-                                 if len > 0 {
-                                     let buffer = Buffer::from(data[..len].to_vec());
-                                     match ctx {
-                                         ConnectionContext::Client { on_data, .. } => {
-                                             on_data.call(Ok(buffer), ThreadsafeFunctionCallMode::NonBlocking);
-                                         },
-                                         ConnectionContext::Server { on_data, .. } => {
-                                             on_data.call(Ok((*id, buffer)), ThreadsafeFunctionCallMode::NonBlocking);
-                                         }
-                                     }
-                                 }
-                             }
-                        }
-                     }
-                     if socket.state() == tcp::State::Closed {
-                         match ctx {
-                             ConnectionContext::Client { on_close, .. } => {
-                                 on_close.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking); 
-                             },
-                             ConnectionContext::Server { on_close, .. } => {
-                                 on_close.call(Ok(*id), ThreadsafeFunctionCallMode::NonBlocking);
-                             }
-                         }
-                         to_remove.push(*id);
-                     }
-                }
-                for id in to_remove {
-                    if let Some((handle, _)) = connections.remove(&id) {
-                         socket_set.remove(handle);
-                         pending_data.remove(&id); // Clean up pending data for closed connections
-                    }
-                }
-
-                // Process ICMP Responses
-                let icmp_socket = socket_set.get_mut::<smoltcp::socket::icmp::Socket>(icmp_handle);
-                if icmp_socket.can_recv() {
-                    let mut data = vec![0; 1024];
-                    if let Ok((len, _)) = icmp_socket.recv_slice(&mut data) {
-                        if len >= 8 && data[0] == 0 { // Echo Reply (0)
-                            let seq = ((data[6] as u16) << 8) | (data[7] as u16);
-                            if let Some((resp, start_time)) = pending_pings.remove(&seq) {
-                                let elapsed = start_time.elapsed().as_millis() as u32;
-                                let _ = resp.send(Ok(elapsed));
-                            }
-                        }
-                    }
-                }
-
-                let mut expired_pings = Vec::new();
-                for (seq, (_, start_time)) in pending_pings.iter() {
-                    if start_time.elapsed().as_secs() > 2 { // 2 second timeout
-                        expired_pings.push(*seq);
-                    }
-                }
-                for seq in expired_pings {
-                    if let Some((resp, _)) = pending_pings.remove(&seq) {
-                        let _ = resp.send(Err(Error::from_reason("Ping timeout")));
-                    }
-                }
-
-                // Check if any connections can now send pending buffered data
-                for (id, (handle, _)) in connections.iter() {
-                    let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-                    if socket.can_send() {
-                        if let Some(buffers) = pending_data.get_mut(id) {
-                            if !buffers.is_empty() {
-                                eprintln!("[FLUSH] Flushing {} buffered chunks for connection {}", buffers.len(), id);
-                                for data in buffers.drain(..) {
-                                    match socket.send_slice(&data) {
-                                        Ok(sent) => {
-                                            eprintln!("[FLUSH] Sent {} bytes to TCP socket", sent);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[FLUSH] Error: {:?}", e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                                        // --- Server: Check for incoming connections ---
-                                        let mut new_connections = Vec::new(); 
-                                        for (&port, &handle) in listening_sockets.iter() {
-                                            let socket = socket_set.get::<tcp::Socket>(handle);
-                                            // Actively established means we accepted a handshake
-                                            if socket.state() == tcp::State::Established {
-                                                if let Some(remote) = socket.remote_endpoint() {
-                                                    new_connections.push((port, handle, remote));
-                                                }
-                                            }
-                                        }
-
-                                        for (port, handle, remote) in new_connections {
-                                            if let Some(info) = listeners.get(&port) {
-                                                let id = next_conn_id;
-                                                next_conn_id += 1;
-                                                
-                                                let remote_ip = match remote.addr { IpAddress::Ipv4(ip) => ip.to_string(), _ => "unknown".to_string() };
-                                                let remote_port = remote.port;
-                                                
-                                                connections.insert(id, (handle, ConnectionContext::Server {
-                                                    on_data: info.on_data.clone(),
-                                                    on_close: info.on_close.clone()
-                                                }));
-
-                                                info.on_connection.call(Ok((id, remote_ip.clone(), remote_port)), ThreadsafeFunctionCallMode::NonBlocking);
-                                                
-                                                eprintln!("[SERVER] Accepted conn {} from {}:{}", id, remote_ip, remote_port);
-
-                                                // Create Replacement Listener Socket for this port
-                                                let rx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
-                                                let tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
-                                                let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-
-                                                let local_endpoint = (IpAddress::Ipv4(source_ip_addr), port);
-                                                if let Ok(_) = socket.listen(local_endpoint) {
-                                                    let new_handle = socket_set.add(socket);
-                                                    listening_sockets.insert(port, new_handle); // Replace occupied handle
-                                                } else {
-                                                    eprintln!("[SERVER] Failed to create replacement listener socket for port {}", port);
-                                                    listening_sockets.remove(&port); // IMPORTANT: remove old handle to prevent infinite loop
-                                                }
-                                            }
-                                        }
-
-                                // Poll to generate packets
-                                iface.poll(Instant::now(), &mut device, &mut socket_set);
-                                
-                                // Send packets through WireGuard
-                                while let Some(packet) = device.tx_queue.pop_front() {
-                                    match tunn.encapsulate(&packet, &mut dst_buf) {
-                                        TunnResult::WriteToNetwork(b) => {
-                                            let _ = udp_socket.try_send(b);
-                                            eprintln!("[FLUSH] Sent {} bytes through WireGuard", b.len());
-                                        }
-                                        _ => {}
-                                    }
-                                }
-            } // end loop
-        }); // end spawn
-
-        Ok(Self { cmd_tx })
+        let (tunn, source_ip_addr) =
+            build_tunnel(&private_key, &peer_public_key, preshared_key.as_deref(), &source_ip, persistent_keepalive)?;
+        Ok(Self::spawn(tunn, source_ip_addr, TransportConfig::Udp { endpoint, listen_port }))
     }
 
-    #[napi]
-    pub async fn connect(&self, dest_ip: String, dest_port: u16, on_data: ThreadsafeFunction<Buffer>, on_close: ThreadsafeFunction<()>) -> Result<Connection> {
-        let dest_ip_addr = Ipv4Address::from_str(&dest_ip).map_err(|_| Error::from_reason("Invalid dest IP"))?;
-        
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(NetworkCommand::Connect { 
-            dest_ip: dest_ip_addr, 
-            dest_port, 
-            on_data,
-            on_close,
-            resp: tx 
-        }).await.map_err(|_| Error::from_reason("Failed to send command"))?;
-
-        let id = match rx.await {
-            Ok(res) => res?,
-            Err(_) => return Err(Error::from_reason("Connection Task Failed")),
-        };
-        
-        Ok(Connection { id, cmd_tx: self.cmd_tx.clone() })
+    /// Alias for the positional UDP constructor (`new`), matching the transport
+    /// factory naming (`overUdp` / `wsClient` / `wsServer`).
+    #[napi(factory)]
+    pub fn over_udp(
+        private_key: String,
+        peer_public_key: String,
+        preshared_key: Option<String>,
+        endpoint: String,
+        source_ip: String,
+        listen_port: Option<u16>,
+        persistent_keepalive: Option<u16>,
+    ) -> Result<Self> {
+        Self::new(private_key, peer_public_key, preshared_key, endpoint, source_ip, listen_port, persistent_keepalive)
     }
 
-    #[napi]
-    pub async fn listen(&self, port: u16, on_connection: ThreadsafeFunction<(u32, String, u16)>, on_data: ThreadsafeFunction<(u32, Buffer)>, on_close: ThreadsafeFunction<u32>) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(NetworkCommand::Listen {
-            port,
-            on_connection,
-            on_data,
-            on_close,
-            resp: tx,
-        }).await.map_err(|_| Error::from_reason("Failed to send Listen command"))?;
+    /// Create the tunnel as a WebSocket client. Connects to `url` (`ws://` or
+    /// `wss://`); each WireGuard packet is one binary frame. TLS uses rustls
+    /// (system roots by default, a pinned `tls.ca` PEM, or `tls.insecureSkipVerify`
+    /// which disables verification and is for tests only).
+    #[napi(factory)]
+    pub fn ws_client(options: WsClientOptions) -> Result<Self> {
+        let (tunn, source_ip_addr) = build_tunnel(
+            &options.private_key,
+            &options.peer_public_key,
+            options.preshared_key.as_deref(),
+            &options.source_ip,
+            options.persistent_keepalive,
+        )?;
+        let tls = options.tls.unwrap_or_default();
+        let cfg = WsClientConfig {
+            url: options.url,
+            path_prefix: options.path_prefix,
+            headers: options.headers,
+            keepalive_sec: options.keepalive_sec.filter(|&s| s > 0).unwrap_or(20),
+            tls_ca: tls.ca,
+            insecure_skip_verify: tls.insecure_skip_verify.unwrap_or(false),
+        };
+        Ok(Self::spawn(tunn, source_ip_addr, TransportConfig::WsClient(cfg)))
+    }
 
-        match rx.await {
-            Ok(res) => res,
-            Err(_) => Err(Error::from_reason("Listen Task Failed")),
+    /// Create the tunnel as a WebSocket server. Binds `listen` (`host:port`) and
+    /// accepts one WS client at a time (1:1 peer model); if the connection drops
+    /// the tunnel goes Ready -> Connecting and a new client is awaited. TLS is
+    /// enabled by providing `tls.cert` + `tls.key` PEM (wss); without it plain
+    /// `ws` is served (e.g. behind a TLS-terminating reverse proxy).
+    #[napi(factory)]
+    pub fn ws_server(options: WsServerOptions) -> Result<Self> {
+        let (tunn, source_ip_addr) = build_tunnel(
+            &options.private_key,
+            &options.peer_public_key,
+            options.preshared_key.as_deref(),
+            &options.source_ip,
+            options.persistent_keepalive,
+        )?;
+        let tls = options.tls.map(|t| (t.cert, t.key));
+        let cfg = WsServerConfig {
+            listen: options.listen,
+            keepalive_sec: options.keepalive_sec.filter(|&s| s > 0).unwrap_or(20),
+            tls,
+        };
+        Ok(Self::spawn(tunn, source_ip_addr, TransportConfig::WsServer(cfg)))
+    }
+
+    /// Resolves once the WireGuard handshake has completed (immediately if it
+    /// already has). Rejects on timeout (default 10000 ms), setup failure or shutdown.
+    #[napi]
+    pub async fn wait_for_handshake(&self, timeout_ms: Option<u32>) -> Result<()> {
+        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+        let mut rx = self.handle.state_rx.clone();
+        let res = tokio::time::timeout(
+            Duration::from_millis(u64::from(timeout_ms)),
+            rx.wait_for(|s| !matches!(s, TunnelState::Connecting)),
+        )
+        .await;
+        let state = match res {
+            Err(_) => return Err(Error::from_reason(format!("WireGuard handshake timed out after {} ms", timeout_ms))),
+            Ok(Err(_)) => return Err(self.handle.gone()),
+            Ok(Ok(state)) => state.clone(),
+        };
+        match state {
+            TunnelState::Ready => Ok(()),
+            TunnelState::Failed(msg) => Err(Error::from_reason(format!("WireShade setup failed: {}", msg))),
+            TunnelState::Closed | TunnelState::Connecting => Err(Error::from_reason("WireShade has been shut down")),
         }
     }
 
-    /// Send data to a connection by ID (works for both client and server connections)
+    /// Resolves once the WireGuard session is lost, i.e. the tunnel state
+    /// leaves `Ready` (Ready -> Connecting on session loss, or -> Failed /
+    /// Closed). Resolves immediately if the tunnel is not currently `Ready`
+    /// (never handshook, already reconnecting, or shut down). Safe to call
+    /// repeatedly and concurrently.
+    #[napi]
+    pub async fn wait_for_disconnect(&self) -> Result<()> {
+        let mut rx = self.handle.state_rx.clone();
+        // `wait_for` returns immediately when the predicate already holds and
+        // otherwise on the next state change; an error means the sender was
+        // dropped (task gone), which is itself a disconnect.
+        let _ = rx.wait_for(|s| !matches!(s, TunnelState::Ready)).await;
+        Ok(())
+    }
+
+    /// Stop the network task. Open connections receive `onClose`, pending
+    /// connects/pings/sends are rejected. Idempotent.
+    #[napi]
+    pub async fn shutdown(&self) -> Result<()> {
+        let (resp, rx) = oneshot::channel();
+        if self.handle.cmd_tx.send(NetworkCommand::Shutdown { resp }).await.is_ok() {
+            let _ = rx.await;
+        }
+        Ok(())
+    }
+
+    /// Open a TCP connection. Resolves once established; rejects on RST or after 10 s.
+    #[napi]
+    pub async fn connect(
+        &self,
+        dest_ip: String,
+        dest_port: u16,
+        on_data: ThreadsafeFunction<Buffer>,
+        on_close: ThreadsafeFunction<()>,
+    ) -> Result<Connection> {
+        let dest_ip = Ipv4Address::from_str(&dest_ip).map_err(|_| Error::from_reason(format!("Invalid destination IP: {}", dest_ip)))?;
+        let (resp, rx) = oneshot::channel();
+        let id = self
+            .handle
+            .request(NetworkCommand::Connect { dest_ip, dest_port, on_data, on_close, resp }, rx)
+            .await?;
+        Ok(Connection {
+            id,
+            handle: self.handle.clone(),
+        })
+    }
+
+    /// Listen for incoming TCP connections on the tunnel IP.
+    #[napi]
+    pub async fn listen(
+        &self,
+        port: u16,
+        on_connection: ThreadsafeFunction<(u32, String, u16)>,
+        on_data: ThreadsafeFunction<(u32, Buffer)>,
+        on_close: ThreadsafeFunction<u32>,
+    ) -> Result<()> {
+        let (resp, rx) = oneshot::channel();
+        self.handle
+            .request(NetworkCommand::Listen { port, on_connection, on_data, on_close, resp }, rx)
+            .await
+    }
+
+    /// Send data to a connection by ID (client or server). Resolves once all
+    /// bytes are queued in the TCP send buffer.
     #[napi]
     pub async fn send_to(&self, connection_id: u32, data: Buffer) -> Result<()> {
-        let vec_data: Vec<u8> = data.into();
-        self.cmd_tx.send(NetworkCommand::SendData {
-            connection_id,
-            data: vec_data
-        }).await.map_err(|_| Error::from_reason("Failed to send data"))?;
-        Ok(())
+        self.handle.send_data(connection_id, data).await
     }
 
-    /// Close a connection by ID (works for both client and server connections)
+    /// Gracefully close a connection by ID (client or server).
     #[napi]
     pub async fn close_connection(&self, connection_id: u32) -> Result<()> {
-        self.cmd_tx.send(NetworkCommand::Close {
-            connection_id
-        }).await.map_err(|_| Error::from_reason("Failed to close connection"))?;
-        Ok(())
+        self.handle.close(connection_id).await
     }
 
-    /// Ping an IP via ICMP
+    /// Pause inbound delivery on a connection: the engine stops draining its
+    /// RX queue, so the TCP window closes and the peer throttles. Data already
+    /// buffered is delivered on `resumeConnection`. Unknown/closed id: no-op.
+    #[napi]
+    pub async fn pause_connection(&self, connection_id: u32) -> Result<()> {
+        self.handle.pause(connection_id).await
+    }
+
+    /// Resume inbound delivery on a connection paused by `pauseConnection`,
+    /// draining already-buffered data through `onData`. Unknown/closed id: no-op.
+    #[napi]
+    pub async fn resume_connection(&self, connection_id: u32) -> Result<()> {
+        self.handle.resume(connection_id).await
+    }
+
+    /// Ping an IP via ICMP. Resolves with the round-trip time in ms.
     #[napi]
     pub async fn ping(&self, dest_ip: String) -> Result<u32> {
-        let dest_ip_addr = Ipv4Address::from_str(&dest_ip).map_err(|_| Error::from_reason("Invalid dest IP"))?;
-        
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(NetworkCommand::Ping { 
-            dest_ip: dest_ip_addr, 
-            resp: tx 
-        }).await.map_err(|_| Error::from_reason("Failed to send Ping command"))?;
-
-        match rx.await {
-            Ok(res) => res,
-            Err(_) => Err(Error::from_reason("Ping Task Failed")),
-        }
+        let dest_ip = Ipv4Address::from_str(&dest_ip).map_err(|_| Error::from_reason(format!("Invalid destination IP: {}", dest_ip)))?;
+        let (resp, rx) = oneshot::channel();
+        self.handle.request(NetworkCommand::Ping { dest_ip, resp }, rx).await
     }
 }
 
+/// An established client TCP connection.
 #[napi]
 pub struct Connection {
     id: u32,
-    cmd_tx: mpsc::Sender<NetworkCommand>,
+    handle: TaskHandle,
 }
 
 #[napi]
 impl Connection {
-    #[napi]
-    pub async fn send(&self, data: Buffer) -> Result<()> {
-        let vec_data: Vec<u8> = data.into();
-        self.cmd_tx.send(NetworkCommand::SendData {
-            connection_id: self.id,
-            data: vec_data
-        }).await.map_err(|_| Error::from_reason("Failed to send data"))?;
-        Ok(())
+    /// The connection id, usable with `pauseConnection`/`resumeConnection`.
+    #[napi(getter)]
+    pub fn id(&self) -> u32 {
+        self.id
     }
 
+    /// Resolves once all bytes are queued in the TCP send buffer.
+    #[napi]
+    pub async fn send(&self, data: Buffer) -> Result<()> {
+        self.handle.send_data(self.id, data).await
+    }
+
+    /// Gracefully close the connection (pending data is sent first).
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        self.cmd_tx.send(NetworkCommand::Close {
-            connection_id: self.id
-        }).await.map_err(|_| Error::from_reason("Failed to send close"))?;
-        Ok(())
+        self.handle.close(self.id).await
     }
 }
 
 fn decode_key(key: &str) -> std::result::Result<[u8; 32], String> {
-    let bytes = general_purpose::STANDARD.decode(key).map_err(|e| e.to_string())?;
-    if bytes.len() != 32 {
-        return Err("Key must be 32 bytes".to_string());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
+    let bytes = general_purpose::STANDARD.decode(key.trim()).map_err(|e| e.to_string())?;
+    bytes.try_into().map_err(|_| "Key must be 32 bytes".to_string())
+}
+
+// --- WebSocket transport options (napi object args) ---
+
+/// Client TLS options for `wsClient`. All fields optional.
+#[napi(object)]
+#[derive(Default)]
+pub struct WsClientTlsOptions {
+    /// PEM of a CA / self-signed certificate to trust (pinning). Without it the
+    /// system / webpki root store is used.
+    pub ca: Option<String>,
+    /// SNI server name override. Currently the host of `url` is used for SNI;
+    /// this field is reserved for a later round.
+    pub servername: Option<String>,
+    /// Disable certificate verification entirely. TEST ONLY — never use in production.
+    pub insecure_skip_verify: Option<bool>,
+}
+
+/// Options for `WireShade.wsClient({...})`.
+#[napi(object)]
+pub struct WsClientOptions {
+    pub private_key: String,
+    pub peer_public_key: String,
+    pub preshared_key: Option<String>,
+    pub source_ip: String,
+    /// WireGuard persistent keepalive in seconds (0 / omitted = disabled).
+    pub persistent_keepalive: Option<u16>,
+    /// Target URL, `ws://host:port` or `wss://host:port`.
+    pub url: String,
+    /// Optional path appended to the URL (e.g. `v1` -> `/v1`).
+    pub path_prefix: Option<String>,
+    /// Extra HTTP headers sent on the upgrade request (disguise / auth).
+    pub headers: Option<HashMap<String, String>>,
+    /// WebSocket ping keepalive interval in seconds (default 20).
+    pub keepalive_sec: Option<u32>,
+    pub tls: Option<WsClientTlsOptions>,
+}
+
+/// Server TLS options for `wsServer`. Providing this enables `wss`.
+#[napi(object)]
+pub struct WsServerTlsOptions {
+    /// Certificate chain PEM.
+    pub cert: String,
+    /// Private key PEM.
+    pub key: String,
+}
+
+/// Options for `WireShade.wsServer({...})`.
+#[napi(object)]
+pub struct WsServerOptions {
+    pub private_key: String,
+    pub peer_public_key: String,
+    pub preshared_key: Option<String>,
+    pub source_ip: String,
+    /// WireGuard persistent keepalive in seconds (0 / omitted = disabled).
+    pub persistent_keepalive: Option<u16>,
+    /// Bind address, `host:port`.
+    pub listen: String,
+    /// Optional expected path prefix (accepted but not enforced in this round).
+    pub path_prefix: Option<String>,
+    /// WebSocket ping keepalive interval in seconds (default 20).
+    pub keepalive_sec: Option<u32>,
+    /// TLS cert + key PEM. Omit for plaintext `ws`.
+    pub tls: Option<WsServerTlsOptions>,
+}
+
+/// A self-signed certificate and its private key, both PEM-encoded.
+#[napi(object)]
+pub struct CertPair {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// Generate a self-signed certificate (and key) for the given subject alternative
+/// names, PEM-encoded. Convenience for `wss` test/dev setups without OpenSSL.
+#[napi]
+pub fn generate_self_signed_cert(subject_alt_names: Vec<String>) -> Result<CertPair> {
+    let certified = rcgen::generate_simple_self_signed(subject_alt_names)
+        .map_err(|e| Error::from_reason(format!("Failed to generate self-signed certificate: {}", e)))?;
+    Ok(CertPair {
+        cert_pem: certified.cert.pem(),
+        key_pem: certified.key_pair.serialize_pem(),
+    })
 }
