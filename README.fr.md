@@ -278,6 +278,18 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 `bench/throughput.js` mesure le goodput et le coût CPU par cœur de tout le chemin (crypto WireGuard + `smoltcp` + la frontière NAPI) en loopback : il isole le débit crypto/CPU, pas la latence ni la perte réseau. `bench/iperf3.js` fait passer une véritable paire client/serveur `iperf3` à travers le tunnel pour un chiffre standard de l'industrie, et se saute automatiquement (sortie 0) si `iperf3` n'est pas installé.
 
+Chiffres indicatifs de `bench/throughput_mp.js` sur une seule machine :
+
+| Transport | Goodput (loopback) | CPU (per peer) |
+|-----------|--------------------|----------------|
+| UDP       | ~2.5 Gbit/s (300 MB/s) | ~1.1 cores |
+| WS        | ~2.6 Gbit/s (315 MB/s) | ~1.1 cores |
+| WSS       | ~2.0 Gbit/s (240 MB/s) | ~1.1 cores |
+
+Ce sont des chiffres en **loopback** sur une seule machine (les deux pairs dans des processus distincts) : ils mesurent le débit de la crypto + de la pile en espace utilisateur, **pas** la RTT ni la perte de paquets d'un vrai réseau, vos résultats varieront donc selon le CPU. Agrandir les tampons du socket UDP a rendu le chemin UDP ~4× plus rapide : il est passé de CPU inactif/bloqué à ~1 cœur, limité par le CPU sur le ChaCha20-Poly1305 de WireGuard.
+
+Reproduisez avec `BENCH_TRANSPORT=udp|ws|wss node bench/throughput_mp.js`. Pour une contre-vérification sur sockets réels, `node bench/iperf3.js` fait passer iperf3 à travers le tunnel (là, environ ~1,1 Gbit/s UDP / ~1,3 Gbit/s WSS).
+
 ---
 
 ## 🖥️ Interface en ligne de commande (CLI)
@@ -518,9 +530,9 @@ wireshade socks -c client-wg.conf -t wss --url wss://vpn.example.com:443 --path-
 
 ---
 
-## 🎯 Top 10 des cas d'usage
+## 🎯 Recettes
 
-Des recettes prêtes à copier-coller pour les besoins les plus courants. Chaque extrait est autonome : remplacez les clés, les IP et le chemin du `.conf` par les vôtres, puis exécutez-le après `npm i wireshade`.
+Des recettes éprouvées sur le terrain, prêtes à copier-coller, pour les besoins les plus courants. Chaque extrait est autonome : remplacez les clés, les IP et le chemin du `.conf` par les vôtres, puis exécutez-le après `npm i wireshade`.
 
 ### 1. Appeler une API HTTPS interne à travers le tunnel
 
@@ -713,7 +725,7 @@ console.log(await client.get('http://10.0.0.1/'));
 
 ### 🍳 Autres recettes
 
-Sept autres schémas éprouvés sur le terrain — même style autonome, numérotés à la suite des dix précédents.
+Quelques schémas de plus, numérotés à la suite des précédents — même style autonome.
 
 ### 11. Réutiliser un client BD / Redis existant, sans modification
 

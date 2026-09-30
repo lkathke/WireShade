@@ -278,6 +278,18 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 `bench/throughput.js` 在环回上测量整条路径（WireGuard 加密 + `smoltcp` + NAPI 边界）的有效吞吐（goodput）与每核 CPU 开销——它隔离出加密/CPU 吞吐能力，而非网络延迟或丢包。`bench/iperf3.js` 让一对真实的 `iperf3` 客户端/服务端通过隧道运行，得到业界标准数值；若未安装 `iperf3`，则自动跳过（退出码 0）。
 
+在单台机器上运行 `bench/throughput_mp.js` 得到的参考数值：
+
+| Transport | Goodput (loopback) | CPU (per peer) |
+|-----------|--------------------|----------------|
+| UDP       | ~2.5 Gbit/s (300 MB/s) | ~1.1 cores |
+| WS        | ~2.6 Gbit/s (315 MB/s) | ~1.1 cores |
+| WSS       | ~2.0 Gbit/s (240 MB/s) | ~1.1 cores |
+
+这些是单台机器上的 **环回（loopback）** 数值（两端在各自独立的进程中）：它们测量的是加密 + 用户态协议栈的吞吐能力，**并非** 真实网络的 RTT 或丢包，因此你的结果会因 CPU 而异。增大 UDP 套接字缓冲区后，UDP 路径快了约 4×——从 CPU 空闲/停滞变为约 1 核，受限于 WireGuard 的 ChaCha20-Poly1305 加密。
+
+复现命令：`BENCH_TRANSPORT=udp|ws|wss node bench/throughput_mp.js`。若需用真实套接字交叉验证，`node bench/iperf3.js` 会让 iperf3 通过隧道运行（在那里大约 ~1.1 Gbit/s UDP / ~1.3 Gbit/s WSS）。
+
 ---
 
 ## 🖥️ 命令行界面（CLI）
@@ -518,9 +530,9 @@ wireshade socks -c client-wg.conf -t wss --url wss://vpn.example.com:443 --path-
 
 ---
 
-## 🎯 十大使用场景
+## 🎯 使用手册
 
-面向最常见需求的即用型代码示例。每段代码都可独立运行——替换成你自己的密钥、IP 和 `.conf` 路径，在 `npm i wireshade` 之后即可运行。
+面向最常见需求、经过实战检验的即用型代码示例。每段代码都可独立运行——替换成你自己的密钥、IP 和 `.conf` 路径，在 `npm i wireshade` 之后即可运行。
 
 ### 1. 通过隧道调用内部 HTTPS API
 
@@ -713,7 +725,7 @@ console.log(await client.get('http://10.0.0.1/'));
 
 ### 🍳 更多用法
 
-另外七个经过实战检验的模式——延续上面十个的独立风格，编号顺延。
+再补充几个模式——延续上面的独立风格，编号顺延。
 
 ### 11. 无需改动，复用现有的数据库 / Redis 客户端
 

@@ -278,6 +278,18 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 `bench/throughput.js` mide el goodput y el coste de CPU por núcleo de todo el camino (cripto de WireGuard + `smoltcp` + la frontera NAPI) sobre loopback: aísla el rendimiento cripto/CPU, no la latencia ni la pérdida de red. `bench/iperf3.js` conduce un par real cliente/servidor de `iperf3` a través del túnel para obtener una cifra estándar del sector, y se salta automáticamente (salida 0) si `iperf3` no está instalado.
 
+Cifras orientativas de `bench/throughput_mp.js` en una sola máquina:
+
+| Transport | Goodput (loopback) | CPU (per peer) |
+|-----------|--------------------|----------------|
+| UDP       | ~2.5 Gbit/s (300 MB/s) | ~1.1 cores |
+| WS        | ~2.6 Gbit/s (315 MB/s) | ~1.1 cores |
+| WSS       | ~2.0 Gbit/s (240 MB/s) | ~1.1 cores |
+
+Son cifras de **loopback** en una sola máquina (ambos peers en procesos separados): miden el rendimiento de la cripto + la pila en espacio de usuario, **no** la RTT ni la pérdida de paquetes de una red real, así que tus resultados variarán según la CPU. Ampliar los búferes del socket UDP hizo la ruta UDP ~4× más rápida: pasó de CPU inactiva/estancada a ~1 núcleo, limitada por la CPU en el ChaCha20-Poly1305 de WireGuard.
+
+Reproduce con `BENCH_TRANSPORT=udp|ws|wss node bench/throughput_mp.js`. Para una comprobación cruzada con sockets reales, `node bench/iperf3.js` conduce iperf3 a través del túnel (allí, aproximadamente ~1,1 Gbit/s UDP / ~1,3 Gbit/s WSS).
+
 ---
 
 ## 🖥️ Interfaz de línea de comandos (CLI)
@@ -518,9 +530,9 @@ wireshade socks -c client-wg.conf -t wss --url wss://vpn.example.com:443 --path-
 
 ---
 
-## 🎯 Los 10 principales casos de uso
+## 🎯 Recetario
 
-Recetas listas para copiar y pegar para lo que más se usa. Cada fragmento es autónomo: sustituye tus propias claves, IPs y la ruta del `.conf`, y ejecútalo tras `npm i wireshade`.
+Recetas probadas en producción, listas para copiar y pegar, para lo que más se usa. Cada fragmento es autónomo: sustituye tus propias claves, IPs y la ruta del `.conf`, y ejecútalo tras `npm i wireshade`.
 
 ### 1. Llamar a una API HTTPS interna a través del túnel
 
@@ -713,7 +725,7 @@ console.log(await client.get('http://10.0.0.1/'));
 
 ### 🍳 Más recetas
 
-Siete patrones más probados en producción — con el mismo estilo autónomo, numerados a continuación de los diez anteriores.
+Unos cuantos patrones más, numerados a continuación de los anteriores — con el mismo estilo autónomo.
 
 ### 11. Reutilizar un cliente de BD / Redis existente, sin cambios
 

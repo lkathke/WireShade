@@ -278,6 +278,18 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 `bench/throughput.js` measures the goodput and per-core CPU cost of the full path (WireGuard crypto + `smoltcp` + the NAPI boundary) on loopback — it isolates crypto/CPU throughput, not network latency or loss. `bench/iperf3.js` drives a real `iperf3` client/server pair through the tunnel for an industry-standard number, and auto-skips (exit 0) if `iperf3` is not installed.
 
+Indicative numbers from `bench/throughput_mp.js` on a single machine:
+
+| Transport | Goodput (loopback) | CPU (per peer) |
+|-----------|--------------------|----------------|
+| UDP       | ~2.5 Gbit/s (300 MB/s) | ~1.1 cores |
+| WS        | ~2.6 Gbit/s (315 MB/s) | ~1.1 cores |
+| WSS       | ~2.0 Gbit/s (240 MB/s) | ~1.1 cores |
+
+These are **loopback** numbers on a single machine (both peers in separate processes): they measure crypto + userspace-stack throughput, **not** real network RTT or packet loss, so your results will vary by CPU. Enlarging the UDP socket buffers made the UDP path ~4× faster — it went from CPU-idle/stalled to ~1 core, CPU-bound on WireGuard's ChaCha20-Poly1305.
+
+Reproduce with `BENCH_TRANSPORT=udp|ws|wss node bench/throughput_mp.js`. For a real-socket cross-check, `node bench/iperf3.js` drives iperf3 through the tunnel (roughly ~1.1 Gbit/s UDP / ~1.3 Gbit/s WSS there).
+
 ---
 
 ## 🖥️ Command-Line Interface (CLI)
@@ -518,9 +530,9 @@ wireshade socks -c client-wg.conf -t wss --url wss://vpn.example.com:443 --path-
 
 ---
 
-## 🎯 Top 10 Use Cases
+## 🎯 Cookbook
 
-Copy-paste recipes for what people reach for most. Every snippet is self-contained — swap in your own keys, IPs, and `.conf` path, and run it after `npm i wireshade`.
+Field-tested, copy-paste recipes for what people reach for most. Every snippet is self-contained — swap in your own keys, IPs, and `.conf` path, and run it after `npm i wireshade`.
 
 ### 1. Call an internal HTTPS API through the tunnel
 
@@ -713,7 +725,7 @@ console.log(await client.get('http://10.0.0.1/'));
 
 ### 🍳 More recipes
 
-Seven more field-tested patterns — same self-contained style, numbered on from the ten above.
+A few more patterns, numbered on from the ones above — same self-contained style.
 
 ### 11. Reuse an existing DB / Redis client, unchanged
 
