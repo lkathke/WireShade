@@ -19,7 +19,8 @@ function parseArgs(argv) {
         if (!a.startsWith('-')) { (opts._ = opts._ || []).push(a); continue; }
         a = a.replace(/^--?/, '');
         if (alias[a]) a = alias[a];
-        if (a === 'verbose' || a === 'help' || a === 'insecure') { opts[a] = true; continue; }
+        if (a === 'verbose' || a === 'help' || a === 'insecure'
+            || a === 'set-system-proxy' || a === 'dry-run-proxy') { opts[a] = true; continue; }
         const next = argv[i + 1];
         if (next === undefined || next.startsWith('-')) { opts[a] = true; }
         else { opts[a] = next; i++; }
@@ -36,6 +37,7 @@ const USAGE = `wireshade - userspace WireGuard tunnel & SOCKS5 proxy
 
 Usage:
   wireshade socks   [options]     Connect and expose a local SOCKS5 proxy
+  wireshade unset-proxy           Restore system proxy settings (crash recovery)
   wireshade genkey                Print a new WireGuard key pair
   wireshade version               Print version
   wireshade help                  Show this help
@@ -57,12 +59,26 @@ socks options:
 
   -l, --listen <[host:]port>     local SOCKS5 bind (default: 127.0.0.1:1080)
       --auth <user:pass>         require SOCKS5 username/password
+      --dns <ip>                 resolve hostnames via this DNS server through
+                                 the tunnel (DNS-over-TCP; default: .conf DNS)
+      --set-system-proxy         point the OS at this proxy (restored on exit)
+      --proxy-method <pac|registry>  Windows method (default: pac = real SOCKS5)
+      --chrome [url]             launch Chrome/Edge/Chromium via this proxy
+                                 (isolated profile; closing it stops wireshade)
+      --chrome-path <file>       browser executable (else auto-detected)
   -v, --verbose                  log each proxied connection
+
+Notes:
+  Reaching the public internet (not just the VPN range) requires the WireGuard
+  server to be an exit node (IP forwarding + NAT). WireShade forwards any host;
+  the exit IP is the server's.
 
 Examples:
   wireshade socks -c wg0.conf
   wireshade socks -c wg0.conf -l 0.0.0.0:1080 --auth alice:secret
   wireshade socks -c wg0.conf -t wss --url wss://vpn.example.com:443 --ca server.pem
+  wireshade socks -c wg0.conf --chrome https://example.internal
+  wireshade socks -c wg0.conf --set-system-proxy
 `;
 
 function parseListen(v) {
@@ -135,21 +151,59 @@ async function cmdSocks(o) {
     await client.start();
     process.stderr.write(`wireshade: tunnel up (source ${config.wireguard.sourceIp})\n`);
 
-    const srv = await client.socks(port, host, { auth, logging: !!o.verbose });
+    // DNS through the tunnel: --dns <ip>, else the .conf's DNS = ... (if any).
+    const dns = (o.dns && o.dns !== true) ? o.dns
+        : (config.wireguard && config.wireguard.dns) || null;
+
+    const srv = await client.socks(port, host, { auth, dns, logging: !!o.verbose });
     process.stderr.write(`wireshade: SOCKS5 proxy listening on ${host}:${port}`
-        + (auth ? ' (auth required)' : '') + '\n');
+        + (auth ? ' (auth required)' : '') + (dns ? ` (DNS via ${dns} in-tunnel)` : '') + '\n');
     process.stderr.write(`wireshade: e.g. curl --socks5-hostname ${host}:${port} http://<vpn-host>/\n`);
+
+    // The address a system proxy / browser should point at (loopback if bound to any).
+    const advHost = (host === '0.0.0.0' || host === '::') ? '127.0.0.1' : host;
+    const plog = (m) => process.stderr.write('wireshade: ' + m + '\n');
+
+    let restoreProxy = null;
+    if (o['set-system-proxy']) {
+        const { setSystemProxy, unsetSystemProxy } = require('../lib/system_proxy');
+        const method = (o['proxy-method'] || 'pac').toLowerCase();
+        const dryRun = !!o['dry-run-proxy'];
+        setSystemProxy({ host: advHost, port, method, dryRun, log: plog });
+        restoreProxy = () => { try { unsetSystemProxy({ dryRun, log: plog }); } catch { /* ignore */ } };
+        plog('system proxy set (will be restored on exit)');
+    }
 
     let closing = false;
     const shutdown = () => {
         if (closing) return;
         closing = true;
         process.stderr.write('\nwireshade: shutting down ...\n');
+        if (restoreProxy) restoreProxy();          // synchronous (spawnSync) — runs before exit
         try { srv.close(); } catch { /* ignore */ }
         Promise.resolve(client.close()).finally(() => process.exit(0));
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
+
+    if (o.chrome) {
+        const { launchBrowser } = require('../lib/launch_browser');
+        const startUrl = (typeof o.chrome === 'string') ? o.chrome : undefined;
+        try {
+            const { child } = launchBrowser({
+                host: advHost, port, url: startUrl, browserPath: o['chrome-path'], log: plog
+            });
+            if (child) child.on('exit', () => { plog('browser closed'); shutdown(); });
+        } catch (e) {
+            plog('could not launch browser: ' + e.message);
+        }
+    }
+}
+
+async function cmdUnsetProxy(o) {
+    const { unsetSystemProxy } = require('../lib/system_proxy');
+    const ok = unsetSystemProxy({ dryRun: !!o['dry-run-proxy'], log: (m) => process.stderr.write('wireshade: ' + m + '\n') });
+    if (!ok) process.stderr.write('wireshade: nothing to restore\n');
 }
 
 async function main() {
@@ -161,6 +215,9 @@ async function main() {
     switch (cmd) {
         case 'socks':
             await cmdSocks(o);
+            break;
+        case 'unset-proxy':
+            await cmdUnsetProxy(o);
             break;
         case 'genkey': {
             const k = generateKeyPair();

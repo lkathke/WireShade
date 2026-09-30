@@ -253,6 +253,8 @@ export declare class WireShadeWsServer extends WireShadeClient {
 export declare class WireShadeSocksServer extends EventEmitter {
   constructor(client: WireShadeClient, options?: {
     auth?: { username: string; password: string } | ((user: string, pass: string) => boolean)
+    /** Resolver IP reachable inside the tunnel; hostnames are resolved via DNS-over-TCP through the VPN. */
+    dns?: string
     logging?: boolean
   })
   listen(port: number, host?: string): Promise<WireShadeSocksServer>
