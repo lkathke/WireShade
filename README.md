@@ -280,6 +280,201 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 ---
 
+## 🎯 Top 10 Use Cases
+
+Copy-paste recipes for what people reach for most. Every snippet is self-contained — swap in your own keys, IPs, and `.conf` path, and run it after `npm i wireshade`.
+
+### 1. Call an internal HTTPS API through the tunnel
+
+Reach a private API that only exists inside the VPN — with the built-in helper or via an axios/got/fetch agent.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// Built-in helper — resolves with the response body:
+const json = await client.get('https://10.0.0.1/api/health');
+console.log(JSON.parse(json));
+
+// …or hand the tunnel agents to axios / got / node-fetch:
+const axios = require('axios');
+const { data } = await axios.get('https://internal.api/users', {
+    httpAgent: client.getHttpAgent(),
+    httpsAgent: client.getHttpsAgent()
+});
+```
+
+### 2. Connect from an existing WireGuard `.conf`
+
+Point WireShade at a standard config file — no key handling in code.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+// A standard [Interface] / [Peer] file is parsed for you.
+const client = new WireShade('/etc/wireguard/wg0.conf');
+await client.start();
+
+console.log('tunnel up as', client.config.wireguard.sourceIp);
+await client.close();
+```
+
+### 3. Open a raw TCP connection
+
+Talk to any TCP service (Redis, SMTP, a game server…) over a `net.Socket`-compatible stream.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// A net.Socket-compatible stream straight through the tunnel:
+const socket = client.connect({ host: '10.0.0.5', port: 6379 });
+socket.on('connect', () => socket.write('PING\r\n'));
+socket.on('data', (data) => console.log('reply:', data.toString()));
+socket.on('error', (err) => console.error(err.message));
+```
+
+### 4. Expose a TCP service inside the VPN
+
+Run a listener on your VPN IP that other peers can dial into.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// A TCP server bound to your VPN IP — reachable by other VPN peers.
+await client.listen(9000, (socket) => {
+    socket.on('data', (data) => socket.write(`echo: ${data}`));
+    socket.on('error', () => {});
+});
+console.log('listening inside the VPN on :9000');
+```
+
+### 5. Local port-forward (like `ssh -L`)
+
+Reach a remote VPN service on a local port — e.g. a private database on `localhost`.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// localhost:5432 → 10.0.0.5:5432 inside the VPN.
+await client.forwardLocal(5432, '10.0.0.5', 5432);
+console.log('psql -h localhost -p 5432 now reaches the VPN database');
+```
+
+### 6. Remote port-forward (like `ssh -R`)
+
+Publish a local service into the VPN so any peer can reach it, even behind NAT.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// Publish your local :3000 to VPN peers at <your VPN IP>:8080.
+await client.forwardRemote(8080, 'localhost', 3000);
+console.log('local :3000 is now reachable across the VPN on :8080');
+```
+
+### 7. Serve an Express/HTTP app through the tunnel
+
+Bridge tunnel connections straight into a Node HTTP server — it never binds a public port.
+
+```javascript
+const express = require('express');
+const http = require('http');
+const { WireShade } = require('wireshade');
+
+const app = express();
+app.get('/', (req, res) => res.send('Hello from inside the VPN!'));
+const server = http.createServer(app);   // built, but never binds a local port
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// Feed tunnel connections straight into the Express HTTP server.
+await client.listen(8080, (socket) => server.emit('connection', socket));
+console.log('Express reachable at http://<your VPN IP>:8080');
+```
+
+### 8. Map hostnames to VPN IPs (custom DNS)
+
+Use friendly names for VPN hosts without touching `/etc/hosts`.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+// Map names up front via the `hosts` option…
+const client = new WireShade('wg.conf', {
+    hosts: { 'db.internal.lan': '10.0.0.5' }
+});
+await client.start();
+
+// …or add them at runtime — no /etc/hosts changes needed.
+client.addHost('api.internal.lan', '10.0.0.6');
+
+console.log(await client.get('https://api.internal.lan/status'));
+```
+
+### 9. Health-check a peer with ICMP ping
+
+Measure round-trip time to a peer and detect when it goes dark.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+try {
+    const rttMs = await client.ping('10.0.0.1');
+    console.log(`peer alive — round-trip ${rttMs} ms`);
+} catch {
+    console.error('peer unreachable');
+}
+```
+
+### 10. Punch through a firewall with WebSocket/WSS
+
+Carry the whole tunnel over a single `wss://` port (443) to get through HTTP-only proxies and strict firewalls.
+
+```javascript
+const { WireShade, WireShadeWsServer, generateSelfSignedCert } = require('wireshade');
+
+// --- Server peer (where you can open a port, e.g. 443) ---
+const { certPem, keyPem } = generateSelfSignedCert(['vpn.example.com']);
+const srv = new WireShadeWsServer({
+    listen: '0.0.0.0:443',
+    tls: { cert: certPem, key: keyPem },              // omit tls => plaintext ws://
+    wireguard: { privateKey: '<server private key>', peerPublicKey: '<client public key>', sourceIp: '10.0.0.1' }
+});
+await srv.start();                                     // resolves once bound & listening
+
+// --- Client peer (behind the restrictive firewall) ---
+const client = new WireShade({
+    wireguard: { privateKey: '<client private key>', peerPublicKey: '<server public key>', sourceIp: '10.0.0.2' },
+    transport: {
+        type: 'websocket',
+        url: 'wss://vpn.example.com:443',              // whole tunnel over one TLS port
+        tls: { ca: certPem }                           // pin the self-signed cert
+    }
+});
+await client.start();
+console.log(await client.get('http://10.0.0.1/'));
+```
+
+---
+
 ## 📚 Examples
 
 Runnable scripts live in [`examples/`](examples/):

@@ -280,6 +280,201 @@ BENCH_TRANSPORT=udp node bench/iperf3.js
 
 ---
 
+## 🎯 十大使用场景
+
+面向最常见需求的即用型代码示例。每段代码都可独立运行——替换成你自己的密钥、IP 和 `.conf` 路径，在 `npm i wireshade` 之后即可运行。
+
+### 1. 通过隧道调用内部 HTTPS API
+
+访问仅存在于 VPN 内部的私有 API：使用内置辅助方法，或通过 axios/got/fetch 代理。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// Built-in helper — resolves with the response body:
+const json = await client.get('https://10.0.0.1/api/health');
+console.log(JSON.parse(json));
+
+// …or hand the tunnel agents to axios / got / node-fetch:
+const axios = require('axios');
+const { data } = await axios.get('https://internal.api/users', {
+    httpAgent: client.getHttpAgent(),
+    httpsAgent: client.getHttpsAgent()
+});
+```
+
+### 2. 使用现有的 WireGuard `.conf` 连接
+
+让 WireShade 指向标准配置文件，无需在代码中处理密钥。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+// A standard [Interface] / [Peer] file is parsed for you.
+const client = new WireShade('/etc/wireguard/wg0.conf');
+await client.start();
+
+console.log('tunnel up as', client.config.wireguard.sourceIp);
+await client.close();
+```
+
+### 3. 打开原始 TCP 连接
+
+通过与 `net.Socket` 兼容的流与任意 TCP 服务（Redis、SMTP、游戏服务器……）通信。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// A net.Socket-compatible stream straight through the tunnel:
+const socket = client.connect({ host: '10.0.0.5', port: 6379 });
+socket.on('connect', () => socket.write('PING\r\n'));
+socket.on('data', (data) => console.log('reply:', data.toString()));
+socket.on('error', (err) => console.error(err.message));
+```
+
+### 4. 在 VPN 内部暴露 TCP 服务
+
+在你的 VPN IP 上运行一个监听器，供其他对等端连接。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// A TCP server bound to your VPN IP — reachable by other VPN peers.
+await client.listen(9000, (socket) => {
+    socket.on('data', (data) => socket.write(`echo: ${data}`));
+    socket.on('error', () => {});
+});
+console.log('listening inside the VPN on :9000');
+```
+
+### 5. 本地端口转发（类似 `ssh -L`）
+
+在本地端口访问远程 VPN 服务——例如 `localhost` 上的私有数据库。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// localhost:5432 → 10.0.0.5:5432 inside the VPN.
+await client.forwardLocal(5432, '10.0.0.5', 5432);
+console.log('psql -h localhost -p 5432 now reaches the VPN database');
+```
+
+### 6. 远程端口转发（类似 `ssh -R`）
+
+将本地服务发布到 VPN，让任何对等端都能访问，即使在 NAT 之后。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// Publish your local :3000 to VPN peers at <your VPN IP>:8080.
+await client.forwardRemote(8080, 'localhost', 3000);
+console.log('local :3000 is now reachable across the VPN on :8080');
+```
+
+### 7. 通过隧道提供 Express/HTTP 应用
+
+将隧道连接直接送入 Node HTTP 服务器——从不绑定公网端口。
+
+```javascript
+const express = require('express');
+const http = require('http');
+const { WireShade } = require('wireshade');
+
+const app = express();
+app.get('/', (req, res) => res.send('Hello from inside the VPN!'));
+const server = http.createServer(app);   // built, but never binds a local port
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+// Feed tunnel connections straight into the Express HTTP server.
+await client.listen(8080, (socket) => server.emit('connection', socket));
+console.log('Express reachable at http://<your VPN IP>:8080');
+```
+
+### 8. 将主机名映射到 VPN IP（自定义 DNS）
+
+为 VPN 主机使用易记的名称，无需改动 `/etc/hosts`。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+// Map names up front via the `hosts` option…
+const client = new WireShade('wg.conf', {
+    hosts: { 'db.internal.lan': '10.0.0.5' }
+});
+await client.start();
+
+// …or add them at runtime — no /etc/hosts changes needed.
+client.addHost('api.internal.lan', '10.0.0.6');
+
+console.log(await client.get('https://api.internal.lan/status'));
+```
+
+### 9. 用 ICMP ping 对对等端做健康检查
+
+测量到对等端的往返时间，并检测其何时失联。
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+try {
+    const rttMs = await client.ping('10.0.0.1');
+    console.log(`peer alive — round-trip ${rttMs} ms`);
+} catch {
+    console.error('peer unreachable');
+}
+```
+
+### 10. 用 WebSocket/WSS 穿透防火墙
+
+将整个隧道经由单个 `wss://` 端口（443）传输，以穿透仅允许 HTTP 的代理和严格的防火墙。
+
+```javascript
+const { WireShade, WireShadeWsServer, generateSelfSignedCert } = require('wireshade');
+
+// --- Server peer (where you can open a port, e.g. 443) ---
+const { certPem, keyPem } = generateSelfSignedCert(['vpn.example.com']);
+const srv = new WireShadeWsServer({
+    listen: '0.0.0.0:443',
+    tls: { cert: certPem, key: keyPem },              // omit tls => plaintext ws://
+    wireguard: { privateKey: '<server private key>', peerPublicKey: '<client public key>', sourceIp: '10.0.0.1' }
+});
+await srv.start();                                     // resolves once bound & listening
+
+// --- Client peer (behind the restrictive firewall) ---
+const client = new WireShade({
+    wireguard: { privateKey: '<client private key>', peerPublicKey: '<server public key>', sourceIp: '10.0.0.2' },
+    transport: {
+        type: 'websocket',
+        url: 'wss://vpn.example.com:443',              // whole tunnel over one TLS port
+        tls: { ca: certPem }                           // pin the self-signed cert
+    }
+});
+await client.start();
+console.log(await client.get('http://10.0.0.1/'));
+```
+
+---
+
 ## 📚 示例
 
 可运行脚本位于 [`examples/`](examples/)：
