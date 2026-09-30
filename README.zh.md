@@ -6,7 +6,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/wireshade.svg)](https://www.npmjs.com/package/wireshade)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**WireShade** 使您的 Node.js 应用程序能够直接连接到 WireGuard VPN，而**无需 root 权限**、内核模块或修改系统网络设置。它使用直接集成到 Node.js 中的自定义 Rust TCP/IP 栈（`smoltcp`）完全在用户态运行。
+**WireShade** 让你的 Node.js 应用无需 **root 权限**、内核模块或修改系统网络设置，即可直接连接 WireGuard VPN。它完全运行在用户态，使用直接集成进 Node.js 的自定义 Rust TCP/IP 协议栈（`smoltcp`）——从不创建任何 TUN/TAP 接口。
 
 <div align="center">
 
@@ -18,137 +18,296 @@
 
 ## 🚀 为什么选择 WireShade？
 
-WireShade 以干净的原生用户态解决方案解决了复杂的网络实现挑战：
+*   **🛡️ 隐蔽与安全：** 将特定的 Node.js 流量路由经 WireGuard VPN，同时系统其余流量保持正常。非常适合网页抓取、机器人或安全的服务间通信。
+*   **🌍 反向隧道：** 即使身处 NAT 或防火墙之后，也能把本地 Express/Fastify/Next.js 服务器或原始 TCP 服务暴露到私有 VPN 网络。
+*   **🔌 零配置客户端：** 无需在主机上安装 WireGuard，只需 `npm install` 即可使用。
+*   **🧱 WebSocket / WSS 传输：** 通过单条 `ws://` 或 `wss://` 连接承载整个 WireGuard 隧道，穿透严格的防火墙和仅允许 HTTP 的代理。
+*   **🔄 自动重连：** 内置退避、健康检查和事件，从容应对连接中断与网络切换。
+*   **⚡ 高性能：** 由 Rust 与 NAPI-RS 驱动，性能接近原生。
 
-*   **🛡️ 隐蔽与安全：** 通过安全的 WireGuard VPN 路由特定的 Node.js 流量，同时保持其余系统流量正常。非常适合 **Web 爬虫**、**机器人**或**安全通信**。
-*   **🌍 反向隧道：** 将本地 Express 服务器、WebSocket 服务器或 Next.js 应用程序暴露给私有 VPN 网络，即使您在 NAT 或防火墙后面。
-*   **🔌 零配置客户端：** 无需在主机上安装 WireGuard。只需 `npm install` 即可。
-*   **🔄 自动重连：** 内置逻辑，可无缝处理连接断开和网络更改。
-*   **⚡ 高性能：** 由 Rust 和 NAPI-RS 提供支持，具有近乎原生的性能。
+## 🧠 工作原理
+
+WireShade 通过在你的 Node.js 进程内运行一个**用户态 TCP/IP 协议栈**（[smoltcp](https://github.com/smoltcp-rs/smoltcp)）来绕过宿主操作系统的网络栈：
+
+1.  **握手：** WireShade 与对端完成真正的 WireGuard 握手（经 UDP 或经 WebSocket）。
+2.  **封装：** IP 数据包被加密并封装进传输帧中。
+3.  **用户态路由：** 解密后的数据包由 Rust 中的 `smoltcp` 处理，负责 TCP 状态、重传与缓冲。
+4.  **Node.js 集成：** 数据通过高性能 NAPI 绑定在 Rust 与 Node.js 的 `net.Socket` / `http.Agent` 实例之间流转。
+
+这意味着：**没有虚拟网络接口**、**无需 root**、与现有 VPN **无冲突**，并且**跨平台**支持而无需内核模块。
 
 ## ✅ 支持的平台
 
-| 平台 | 架构 | 状态 |
+原生二进制文件已**为以下六个目标预编译，并在 `require()` 时自动加载**——安装时无需编译器或构建步骤。
+
+| 目标三元组 | 平台 | 架构 |
 | :--- | :--- | :--- |
-| **Windows** | x64 | ✅ |
-| **macOS** | Intel & Apple Silicon | ✅ |
-| **Linux** | x64, ARM64 | ✅ |
-| **Raspberry Pi** | ARMv7 | ✅ |
-| **Docker** | Alpine, Debian | ✅ |
+| `x86_64-pc-windows-msvc` | Windows | x64 |
+| `x86_64-apple-darwin` | macOS | Intel |
+| `aarch64-apple-darwin` | macOS | Apple Silicon |
+| `x86_64-unknown-linux-gnu` | Linux | x64 |
+| `aarch64-unknown-linux-gnu` | Linux | ARM64 |
+| `armv7-unknown-linux-gnueabihf` | Linux / Raspberry Pi | ARMv7 |
 
 ## 📦 安装
 
 ```bash
-npm install wireshade
+npm i wireshade
 ```
 
 ---
 
-## 🛠️ 使用示例
+## ⚡ 快速开始
 
-所有示例均假设您已初始化客户端：
+### 使用配置对象
+
 ```javascript
 const { WireShade } = require('wireshade');
-const client = new WireShade('./wg0.conf');
-await client.start();
-```
 
-### 1. HTTP/HTTPS请求 (客户端)
-使用 WireShade 作为请求的透明代理。
-
-> **关于 DNS 的说明：** 您可以在 `hosts` 配置中将 `internal.service` 等自定义主机名直接映射到 IP 地址。WireShade 将在请求期间自动拦截并解析这些名称。
-
-**原生 `http`/`https` 模块：**
-```javascript
-const https = require('https');
-
-https.get('https://api.internal/data', { agent: client.getHttpsAgent() }, (res) => {
-    res.pipe(process.stdout);
+const client = new WireShade({
+    wireguard: {
+        privateKey: '<base64 private key>',
+        peerPublicKey: '<base64 peer public key>',
+        endpoint: 'vpn.example.com:51820',
+        sourceIp: '10.0.0.2',            // our address inside the tunnel
+        persistentKeepalive: 25          // seconds; 0 disables (default 25)
+    }
 });
+
+await client.start();                    // resolves once the WireGuard handshake completes
+
+// HTTP GET through the tunnel:
+const body = await client.get('http://10.0.0.1/');
+console.log(body);
+
+await client.close();
 ```
 
-**Axios：**
+### 使用 WireGuard `.conf` 文件
+
+传入路径字符串而非配置对象——标准的 `[Interface]` / `[Peer]` 文件会被自动解析（包括 `PersistentKeepalive`）：
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+const body = await client.get('http://10.0.0.1/');
+console.log(body);
+
+await client.close();
+```
+
+若要通过 `axios`、`node-fetch`、`ws` 等发起真实请求，请传入隧道 agent：
+
 ```javascript
 const axios = require('axios');
-
-const response = await axios.get('https://internal.service/api', {
+const res = await axios.get('https://internal.service/api', {
     httpAgent: client.getHttpAgent(),
     httpsAgent: client.getHttpsAgent()
 });
 ```
 
-### 2. 本地 P2P VPN 测试
-您可以在本地运行两个 WireShade 实例，建立用于测试的 P2P VPN 隧道，它们将通过本地 UDP 端口直接连接。
+---
+
+## 🧱 WebSocket / WSS 传输
+
+WireShade 可以不走 UDP，而是通过**单条 WebSocket 连接**承载整个 WireGuard 隧道。这是穿透仅允许 HTTP(S) 的严格防火墙和代理、可靠地「直接连通」的方式。两端都是 WireShade 实例：一端作为 WS **服务端**（终止 TLS + 隧道），另一端作为 WS **客户端**。
+
+### 服务端对等体
 
 ```javascript
-const { WireShade, generateKeyPair } = require('wireshade');
+const { WireShadeWsServer, generateKeyPair, generateSelfSignedCert } = require('wireshade');
 
-const keyA = generateKeyPair();
-const keyB = generateKeyPair();
+const server = generateKeyPair();
+const client = generateKeyPair();
 
-const clientA = new WireShade({
+// Self-signed cert for the names the client will connect to — no OpenSSL needed.
+const { certPem, keyPem } = generateSelfSignedCert(['vpn.example.com']);
+
+const srv = new WireShadeWsServer({
+    listen: '0.0.0.0:443',
+    pathPrefix: 'v1',
+    tls: { cert: certPem, key: keyPem },   // omit `tls` entirely for plaintext ws://
     wireguard: {
-        privateKey: keyA.privateKey,
-        peerPublicKey: keyB.publicKey,
-        endpoint: '127.0.0.1:51821', // 指向 B 的侦听端口
-        sourceIp: '10.0.0.1',
-        listenPort: 51820 // 在此端口上侦听
+        privateKey: server.privateKey,
+        peerPublicKey: client.publicKey,
+        sourceIp: '10.0.0.1'
     }
 });
 
-const clientB = new WireShade({
+await srv.start();                         // resolves once bound & listening (no peer needed yet)
+
+// Now register tunnel services just like the UDP client:
+await srv.listen(8080, (socket) => {
+    socket.on('data', () => socket.end('pong'));
+});
+```
+
+### 客户端对等体
+
+```javascript
+const fs = require('fs');
+const { WireShade } = require('wireshade');
+
+// The server's certificate, as a PEM string (copied from the server).
+const certPem = fs.readFileSync('server-cert.pem', 'utf8');
+
+const client = new WireShade({
     wireguard: {
-        privateKey: keyB.privateKey,
-        peerPublicKey: keyA.publicKey,
-        endpoint: '127.0.0.1:51820', // 指向 A 的侦听端口
-        sourceIp: '10.0.0.2',
-        listenPort: 51821 // 在此端口上侦听
+        privateKey: '<client private key>',
+        peerPublicKey: '<server public key>',
+        sourceIp: '10.0.0.2'               // no `endpoint`: the server terminates the tunnel
+    },
+    transport: {
+        type: 'websocket',                 // 'udp' (default) | 'websocket'
+        url: 'wss://vpn.example.com:443',  // ws:// (plaintext) or wss:// (native TLS)
+        pathPrefix: 'v1',
+        tls: {
+            ca: certPem,                   // pin the self-signed cert (PEM)
+            servername: 'vpn.example.com'  // SNI override (optional)
+            // insecureSkipVerify: true    // TEST ONLY — disables cert verification
+        }
     }
 });
 
-await clientA.start();
-await clientB.start();
+await client.start();                      // resolves on the WireGuard handshake over WSS
 
-// 从 A ping B
-const pingTime = await clientA.ping('10.0.0.2');
-console.log(`Ping successful: ${pingTime}ms`);
+const body = await client.get('http://10.0.0.1:8080/');
+console.log(body);
+await client.close();
 ```
 
-### 3. TCP & WebSockets 到 VPN (客户端)
-连接到 VPN 内部运行的原始 TCP 服务或 WebSocket。
+其余一切——`connect`、`listen`、`forwardLocal`、`forwardRemote`、`ping`、`http`/`https` 包装器以及自动重连逻辑——在 WebSocket 上的表现完全一致。参见 [`examples/13_websocket_highlevel.js`](examples/13_websocket_highlevel.js)（高层）与 [`examples/11_websocket_wss.js`](examples/11_websocket_wss.js)（原生绑定）。
 
-**WebSockets：**
+**`ws://` 与 `wss://` 对比：** 当 TLS 已由 WireShade 前面的反向代理（如 nginx 或 Caddy）终止时，使用明文 `ws://`（省略服务端 `tls` 块）；若要让 WireShade 自己终止 TLS，则使用原生 `wss://`（配合 `tls: { cert, key }`）。在客户端，`tls.ca` 固定（pin）某个特定证书，`tls.servername` 覆盖 SNI，`tls.insecureSkipVerify` 则完全关闭验证——**仅供测试，切勿用于生产**。
+
+> **权衡——TCP over TCP：** WebSocket 传输把 WireGuard（进而把你的内层 TCP）隧道封装在外层 TCP/TLS 流之中。它非常适合穿透防火墙/代理以及可靠、有序的链路，但在丢包或高抖动的路径上，两层叠加的拥塞控制回路可能相互冲突（即「TCP meltdown」）。当网络不可靠时，纯 UDP 传输通常表现更好；当你只需「连通」时，WebSocket 胜出。
+
+---
+
+## 📖 核心 API
+
 ```javascript
-const WebSocket = require('ws');
+const {
+    WireShade,          // = WireShadeClient, the high-level client (main export)
+    WireShadeWsServer,  // high-level WebSocket server peer
+    generateKeyPair,
+    generateSelfSignedCert,
+    parseConfig, readConfig,
+    ConnectionState
+} = require('wireshade');
+```
 
-const ws = new WebSocket('ws://10.0.0.5:8080/stream', {
-    agent: client.getHttpAgent() 
+**`new WireShade(configOrPath, [options])`**
+从配置对象，或从 `.conf` 文件路径（`new WireShade('wg.conf')`）创建客户端。`config.wireguard` 接受常见的 WireGuard 字段：`privateKey`、`peerPublicKey`、`presharedKey`、`endpoint`、`sourceIp`、`listenPort`、`persistentKeepalive`。`persistentKeepalive` 以秒为单位（`.conf` 文件中的 `PersistentKeepalive`），默认为 `25`，设为 `0` 则禁用。其他选项：`logging`（默认 `true`）、`handshakeTimeout`（毫秒，默认 `10000`）、`hosts`、`reconnect`、`transport` 以及 `onConnect`/`onDisconnect`/`onReconnect`。
+
+**`client.start()`** → `Promise<void>`
+建立连接，并在**与对端完成真正的 WireGuard 握手后**兑现（在超时、DNS/绑定错误，或先调用了 `close()` 时被拒绝）。当两端都是 WireShade 实例时，请并发启动它们：`Promise.all([a.start(), b.start()])`。
+
+**`client.close()`** → `Promise<void>`
+停止重连与健康检查，关闭所有服务器/连接并关停原生隧道。在原生任务停止后兑现。（`close()` 是原生 `shutdown()` 的高层等价物。）
+
+**重连** —— 通过 `reconnect` 块配置；状态变化以事件形式呈现：
+
+```javascript
+const client = new WireShade({
+    wireguard: { /* ... */ },
+    reconnect: {
+        enabled: true,             // default true
+        maxAttempts: 10,           // 0 = unlimited
+        delay: 1000,               // initial backoff (ms)
+        maxDelay: 30000,           // backoff ceiling (ms)
+        backoffMultiplier: 1.5,    // exponential backoff factor
+        healthCheckInterval: 30000 // ms; 0 disables
+    }
 });
 
-ws.on('open', () => console.log('已连接到 VPN WebSocket！'));
+client.on('connect',     () => console.log('tunnel up'));
+client.on('disconnect',  (err) => console.log('tunnel down:', err?.message));
+client.on('reconnect',   () => console.log('tunnel restored'));
+client.on('stateChange', (state) => console.log('state:', state)); // see ConnectionState
 ```
 
-### 3. 暴露本地服务器 (反向隧道)
-使您的本地服务器**仅**通过 VPN 可访问。
+已注册的监听器（`listen`/`forwardRemote`）会在重连后于新隧道上自动重建。
 
-**Express / Next.js：**
+**`client.ping(ip)`** → `Promise<number>` —— ICMP 回显；兑现为往返时间（毫秒）。
+
+**`client.connect({ host, port })`** → `Duplex` —— 经隧道的、与 `net.Socket` 兼容的流。触发 `'connect'`、`'data'`、`'end'`、`'error'`。
+
+**`client.listen(port, [onConnection])`** → `Promise<Server>` —— 在 **VPN IP** 上的 TCP 服务器；`onConnection` 每个连接收到一个 socket。
+
+**`client.forwardLocal(localPort, remoteHost, remotePort)`** → `Promise` —— 把 VPN 侧服务暴露到你的本地机器（`localhost:localPort` → VPN 内的 `remoteHost:remotePort`）。
+
+**`client.forwardRemote(vpnPort, targetHost, targetPort)`** → `Promise` —— 把本地服务暴露给 VPN 对等体（VPN IP `:vpnPort` → 你机器上的 `targetHost:targetPort`）。
+
 ```javascript
-const express = require('express');
-const http = require('http');
-const { WireShadeServer } = require('wireshade');
-
-const app = express();
-app.get('/', (req, res) => res.send('🎉 隐藏在 VPN 内部！'));
-
-const httpServer = http.createServer(app);
-const vpnServer = new WireShadeServer(client);
-
-// 将 VPN 套接字传输到 HTTP 服务器
-vpnServer.on('connection', (socket) => httpServer.emit('connection', socket));
-
-await vpnServer.listen(80);
-console.log('服务器在线地址 http://<VPN-IP>/');
+await client.forwardLocal(3333, '10.0.0.5', 5432);   // reach VPN Postgres via localhost:3333
+await client.forwardRemote(8080, 'localhost', 3000); // publish local :3000 on the VPN at :8080
 ```
+
+**`client.get(url, [opts])` / `client.request(url, [opts])`** → `Promise<string | object>` —— 经隧道的 HTTP(S)。兑现为响应体字符串（`opts.encoding`，默认 `utf8`）；当 `opts.fullResponse: true` 时兑现为 `{ statusCode, statusMessage, headers, body, rawBody }`。`opts.body` 设置请求体。
+
+**`client.getHttpAgent()` / `client.getHttpsAgent()`** —— 经隧道路由的 `http.Agent` / `https.Agent`（用于 `axios`、`node-fetch`、`ws` 等）。
+
+**`client.addHost(hostname, ip)`** —— 无需改动 `/etc/hosts` 即可把主机名映射到 VPN IP；该映射用于客户端自身的请求与转发。
+
+**`generateKeyPair()`** → `{ privateKey, publicKey }` —— 一对全新的 WireGuard 密钥。
+
+**`parseConfig(text)` / `readConfig(path)`** —— 将字符串或文件中的 WireGuard 配置解析为配置对象。
+
+**`generateSelfSignedCert(sans)`** → `{ certPem, keyPem }` —— 为给定的 subject alternative names 生成自签名证书及密钥（PEM），便于在开发/测试中无需 OpenSSL 即可使用 `wss://`。
+
+**`new WireShadeWsServer({ listen, pathPrefix, tls, wireguard, ... })`** —— WebSocket 服务端对等体。`listen` 为 `"host:port"`；提供 `tls: { cert, key }` 以启用 `wss://`，省略则为 `ws://`。其 `start()` 在 socket **完成绑定并开始监听**时即兑现（早于任何对端握手），因此可以立刻注册 `listen`/`forwardRemote`。`WireShadeClient` 的其余所有方法与事件同样适用。
+
+---
+
+## 📊 基准测试
+
+WireShade 附带两个基准脚本。数值因机器而异，请自行运行。
+
+```bash
+# Raw tunnel goodput + CPU-per-core on loopback (crypto/CPU cost, not RTT/loss):
+BENCH_TRANSPORT=udp BENCH_SECONDS=5 BENCH_CHUNK=262144 node bench/throughput.js
+#   BENCH_TRANSPORT = udp | ws | wss
+
+# Real iperf3 driven through the tunnel (needs iperf3 in PATH; skips cleanly if absent):
+BENCH_TRANSPORT=udp node bench/iperf3.js
+```
+
+`bench/throughput.js` 在环回上测量整条路径（WireGuard 加密 + `smoltcp` + NAPI 边界）的有效吞吐（goodput）与每核 CPU 开销——它隔离出加密/CPU 吞吐能力，而非网络延迟或丢包。`bench/iperf3.js` 让一对真实的 `iperf3` 客户端/服务端通过隧道运行，得到业界标准数值；若未安装 `iperf3`，则自动跳过（退出码 0）。
+
+---
+
+## 📚 示例
+
+可运行脚本位于 [`examples/`](examples/)：
+
+| 文件 | 演示 |
+| :--- | :--- |
+| `01_quickstart.js` | 连接、请求与监听——「hello world」。 |
+| `02_http_request.js` | 使用 `client.get()` 的简单 HTTP GET。 |
+| `03_https_custom_dns.js` | 将自定义主机名映射到 VPN IP 的 HTTPS。 |
+| `04_tcp_socket.js` | 经隧道的原始 TCP 收发。 |
+| `05_internet_routing.js` | 经 VPN 网关路由公网流量。 |
+| `06_simple_server.js` | 在隧道内托管 TCP/HTTP 服务器。 |
+| `07_express_app.js` | 通过 VPN 暴露 Express 应用（反向隧道）。 |
+| `08_local_forwarding.js` | `forwardLocal`——在 `localhost` 上访问 VPN 服务。 |
+| `09_reconnect_config.js` | 重连、健康检查与事件监控。 |
+| `10_remote_forwarding.js` | `forwardRemote`——把本地服务发布到 VPN。 |
+| `11_websocket_wss.js` | 使用**原生**绑定的 WireGuard over WSS。 |
+| `13_websocket_highlevel.js` | 使用**高层** API 的 WireGuard over WSS。 |
+| `local_vpn.js` | 两个本地对等体构成 P2P 隧道用于测试。 |
+
+---
+
+## 🎯 使用场景
+
+*   **微服务：** 跨云连接服务，无需暴露公网端口。
+*   **网页抓取：** 在不同 endpoint 上运行多个实例以轮换出口 IP。
+*   **开发者访问：** 从笔记本安全地访问私有内部数据库。
+*   **物联网与边缘：** 让位于严格 NAT 之后的设备回连到中央服务器。
 
 ---
 
@@ -157,3 +316,4 @@ console.log('服务器在线地址 http://<VPN-IP>/');
 MIT 许可证。
 
 *WireGuard 是 Jason A. Donenfeld 的注册商标。*
+</content>

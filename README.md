@@ -6,7 +6,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/wireshade.svg)](https://www.npmjs.com/package/wireshade)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**WireShade** enables your Node.js application to connect directly to a WireGuard VPN **without root privileges**, kernel modules, or modifying system network settings. It runs entirely in userspace using a custom Rust-based TCP/IP stack (`smoltcp`) integrated directly into Node.js.
+**WireShade** lets your Node.js application connect directly to a WireGuard VPN **without root privileges**, kernel modules, or changes to your system network settings. It runs entirely in userspace using a custom Rust-based TCP/IP stack (`smoltcp`) integrated directly into Node.js — no TUN/TAP interface is ever created.
 
 <div align="center">
 
@@ -18,289 +18,296 @@
 
 ## 🚀 Why WireShade?
 
-WireShade solves complex networking implementation challenges with a clean, native userspace solution:
-
-*   **🛡️ Stealth & Security:** Route specific Node.js traffic through a secure WireGuard VPN while keeping the rest of your system traffic normal. Perfect for **web scraping**, **bots**, or **secure communication**.
-*   **🌍 Reverse Tunneling:** Expose a local Express server, WebSocket server, or Next.js app to the private VPN network, even if you are behind a NAT or firewall.
-*   **🔌 Zero-Config Client:** No need to install WireGuard on the host machine. Just `npm install` and go.
-*   **🔄 Automatic Reconnection:** Built-in logic to handle connection drops and network changes seamlessly.
+*   **🛡️ Stealth & Security:** Route specific Node.js traffic through a WireGuard VPN while the rest of your system traffic stays normal. Perfect for web scraping, bots, or secure service-to-service communication.
+*   **🌍 Reverse Tunneling:** Expose a local Express/Fastify/Next.js server or a raw TCP service to the private VPN network, even behind a NAT or firewall.
+*   **🔌 Zero-Config Client:** No need to install WireGuard on the host. Just `npm install` and go.
+*   **🧱 WebSocket / WSS Transport:** Carry the whole WireGuard tunnel over a single `ws://` or `wss://` connection to punch through restrictive firewalls and HTTP-only proxies.
+*   **🔄 Automatic Reconnection:** Built-in backoff, health checks, and events to survive connection drops and network changes.
 *   **⚡ High Performance:** Powered by Rust and NAPI-RS for near-native performance.
 
-## 🧠 How it Works (Technical Deep Dive)
+## 🧠 How it Works
 
-WireShade bypasses the host operating system's network stack by running a **userspace TCP/IP stack** ([smoltcp](https://github.com/smoltcp-rs/smoltcp)) inside your Node.js process. 
+WireShade bypasses the host OS network stack by running a **userspace TCP/IP stack** ([smoltcp](https://github.com/smoltcp-rs/smoltcp)) inside your Node.js process:
 
-1.  **Handshake:** WireShade establishes a WireGuard handshake over UDP.
-2.  **Encapsulation:** IP packets are encrypted and encapsulated within UDP packets.
+1.  **Handshake:** WireShade performs a real WireGuard handshake with the peer (over UDP, or over a WebSocket).
+2.  **Encapsulation:** IP packets are encrypted and encapsulated in the transport frames.
 3.  **Userspace Routing:** Decrypted packets are handled by `smoltcp` in Rust, which manages TCP state, retransmission, and buffering.
-4.  **Node.js Integration:** Data moves between Rust streams and Node.js `net.Socket`/`http.Agent` instances via high-performance NAPI bindings.
+4.  **Node.js Integration:** Data moves between Rust and Node.js `net.Socket` / `http.Agent` instances over high-performance NAPI bindings.
 
-This architecture means:
-- **No Virtual Network Interface (TUN/TAP)** is created on your OS.
-- **Root privileges are NOT required.**
-- **No conflict** with existing VPNs or system networking.
-- **Cross-platform** compatibility (Windows, macOS, Linux, **Raspberry Pi**, Docker containers) without kernel modules.
+This means: **no virtual network interface**, **no root**, **no conflict** with existing VPNs, and **cross-platform** support without kernel modules.
 
 ## ✅ Supported Platforms
 
-| Platform | Architecture | Status |
+Native binaries are **prebuilt for the following six targets and loaded automatically** at `require()` time — no compiler or build step needed on install.
+
+| Target triple | Platform | Arch |
 | :--- | :--- | :--- |
-| **Windows** | x64 | ✅ |
-| **macOS** | Intel & Apple Silicon | ✅ |
-| **Linux** | x64, ARM64 | ✅ |
-| **Raspberry Pi** | ARMv7 | ✅ |
-| **Docker** | Alpine, Debian | ✅ |
+| `x86_64-pc-windows-msvc` | Windows | x64 |
+| `x86_64-apple-darwin` | macOS | Intel |
+| `aarch64-apple-darwin` | macOS | Apple Silicon |
+| `x86_64-unknown-linux-gnu` | Linux | x64 |
+| `aarch64-unknown-linux-gnu` | Linux | ARM64 |
+| `armv7-unknown-linux-gnueabihf` | Linux / Raspberry Pi | ARMv7 |
 
 ## 📦 Installation
 
 ```bash
-npm install wireshade
+npm i wireshade
 ```
-
-_Note: Windows users need basic build tools (Visual Studio Build Tools) if prebuilds are not available, but prebuilt binaries are planned._
 
 ---
 
-## 🛠️ Usage Examples
+## ⚡ Quickstart
 
-All examples assume you have initialized the client:
+### From a config object
+
 ```javascript
 const { WireShade } = require('wireshade');
-const client = new WireShade('./wg0.conf');
-await client.start();
-```
 
-### 1. HTTP/HTTPS Requests (Client)
-Use WireShade as a transparent agent for your requests.
-
-**Simplified API:**
-```javascript
-const html = await client.get('https://internal.service/api');
-console.log(html);
-```
-
-> **Note on DNS:** You can map custom hostnames like `internal.service` directly to IP addresses in the `hosts` configuration. WireShade will automatically intercept and resolve these names during the request.
-
-**Native `http`/`https` Module:**
-```javascript
-const https = require('https');
-
-https.get('https://api.internal/data', { agent: client.getHttpsAgent() }, (res) => {
-    res.pipe(process.stdout);
+const client = new WireShade({
+    wireguard: {
+        privateKey: '<base64 private key>',
+        peerPublicKey: '<base64 peer public key>',
+        endpoint: 'vpn.example.com:51820',
+        sourceIp: '10.0.0.2',            // our address inside the tunnel
+        persistentKeepalive: 25          // seconds; 0 disables (default 25)
+    }
 });
+
+await client.start();                    // resolves once the WireGuard handshake completes
+
+// HTTP GET through the tunnel:
+const body = await client.get('http://10.0.0.1/');
+console.log(body);
+
+await client.close();
 ```
 
-**Axios:**
+### From a WireGuard `.conf` file
+
+Pass a path string instead of a config object — a standard `[Interface]` / `[Peer]` file is parsed for you (including `PersistentKeepalive`):
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf');
+await client.start();
+
+const body = await client.get('http://10.0.0.1/');
+console.log(body);
+
+await client.close();
+```
+
+For real requests via `axios`, `node-fetch`, `ws`, etc., pass the tunnel agents:
+
 ```javascript
 const axios = require('axios');
-
-// Configure Axios to use the VPN agent
-const response = await axios.get('https://internal.service/api', {
+const res = await axios.get('https://internal.service/api', {
     httpAgent: client.getHttpAgent(),
     httpsAgent: client.getHttpsAgent()
 });
 ```
 
-**Fetch (`node-fetch`):**
-```javascript
-const fetch = require('node-fetch');
+---
 
-const response = await fetch('https://internal.service/api', {
-    agent: (parsedUrl) => {
-        return parsedUrl.protocol === 'https:' 
-            ? client.getHttpsAgent() 
-            : client.getHttpAgent();
-    }
-});
-```
+## 🧱 WebSocket / WSS Transport
 
-### 2. Local P2P VPN Testing
-You can run two WireShade instances locally to establish a P2P VPN tunnel for testing, connecting them directly via local UDP ports without needing a real server.
+Instead of UDP, WireShade can carry the entire WireGuard tunnel over a **single WebSocket connection**. This is the reliable way to "just get through" restrictive firewalls and proxies that only allow HTTP(S). Both peers are WireShade instances: one runs as the WS **server** (terminates TLS + the tunnel), the other as the WS **client**.
+
+### Server peer
 
 ```javascript
-const { WireShade, generateKeyPair } = require('wireshade');
+const { WireShadeWsServer, generateKeyPair, generateSelfSignedCert } = require('wireshade');
 
-const keyA = generateKeyPair();
-const keyB = generateKeyPair();
+const server = generateKeyPair();
+const client = generateKeyPair();
 
-const clientA = new WireShade({
+// Self-signed cert for the names the client will connect to — no OpenSSL needed.
+const { certPem, keyPem } = generateSelfSignedCert(['vpn.example.com']);
+
+const srv = new WireShadeWsServer({
+    listen: '0.0.0.0:443',
+    pathPrefix: 'v1',
+    tls: { cert: certPem, key: keyPem },   // omit `tls` entirely for plaintext ws://
     wireguard: {
-        privateKey: keyA.privateKey,
-        peerPublicKey: keyB.publicKey,
-        endpoint: '127.0.0.1:51821', // Point to B's listen port
-        sourceIp: '10.0.0.1',
-        listenPort: 51820 // Listen on this port
+        privateKey: server.privateKey,
+        peerPublicKey: client.publicKey,
+        sourceIp: '10.0.0.1'
     }
 });
 
-const clientB = new WireShade({
+await srv.start();                         // resolves once bound & listening (no peer needed yet)
+
+// Now register tunnel services just like the UDP client:
+await srv.listen(8080, (socket) => {
+    socket.on('data', () => socket.end('pong'));
+});
+```
+
+### Client peer
+
+```javascript
+const fs = require('fs');
+const { WireShade } = require('wireshade');
+
+// The server's certificate, as a PEM string (copied from the server).
+const certPem = fs.readFileSync('server-cert.pem', 'utf8');
+
+const client = new WireShade({
     wireguard: {
-        privateKey: keyB.privateKey,
-        peerPublicKey: keyA.publicKey,
-        endpoint: '127.0.0.1:51820', // Point to A's listen port
-        sourceIp: '10.0.0.2',
-        listenPort: 51821 // Listen on this port
+        privateKey: '<client private key>',
+        peerPublicKey: '<server public key>',
+        sourceIp: '10.0.0.2'               // no `endpoint`: the server terminates the tunnel
+    },
+    transport: {
+        type: 'websocket',                 // 'udp' (default) | 'websocket'
+        url: 'wss://vpn.example.com:443',  // ws:// (plaintext) or wss:// (native TLS)
+        pathPrefix: 'v1',
+        tls: {
+            ca: certPem,                   // pin the self-signed cert (PEM)
+            servername: 'vpn.example.com'  // SNI override (optional)
+            // insecureSkipVerify: true    // TEST ONLY — disables cert verification
+        }
     }
 });
 
-await clientA.start();
-await clientB.start();
+await client.start();                      // resolves on the WireGuard handshake over WSS
 
-// Ping from A to B
-const pingTime = await clientA.ping('10.0.0.2');
-console.log(`Ping successful: ${pingTime}ms`);
+const body = await client.get('http://10.0.0.1:8080/');
+console.log(body);
+await client.close();
 ```
 
-### 3. TCP & WebSockets to VPN (Client)
-Connect to raw TCP services or WebSockets running inside the VPN.
+Everything else — `connect`, `listen`, `forwardLocal`, `forwardRemote`, `ping`, the `http`/`https` wrappers and the auto-reconnect logic — works identically over WebSocket. See [`examples/13_websocket_highlevel.js`](examples/13_websocket_highlevel.js) (high-level) and [`examples/11_websocket_wss.js`](examples/11_websocket_wss.js) (native binding).
 
-**Raw TCP:**
-```javascript
-const socket = client.connect({ host: '10.0.0.5', port: 22 });
-socket.write('SSH-2.0-MyClient\r\n');
-```
+**`ws://` vs `wss://`:** use plaintext `ws://` (omit the server `tls` block) when TLS is already terminated in front of WireShade by a reverse proxy such as nginx or Caddy; use native `wss://` (with `tls: { cert, key }`) to let WireShade terminate TLS itself. On the client, `tls.ca` pins a specific certificate, `tls.servername` overrides SNI, and `tls.insecureSkipVerify` disables verification entirely — **for testing only, never in production**.
 
-**WebSockets (using `ws` library):**
-```javascript
-const WebSocket = require('ws');
-
-// Use the WireShade agent for the handshake
-const ws = new WebSocket('ws://10.0.0.5:8080/stream', {
-    agent: client.getHttpAgent() 
-});
-
-ws.on('open', () => console.log('Connected to VPN WebSocket!'));
-```
-
-### 3. Expose Local Servers (Express, Next.js, WebSockets)
-Make your local server accessible **only** via the VPN (Reverse Tunneling).
-
-**Express / Next.js / Fastify:**
-```javascript
-const express = require('express');
-const http = require('http');
-const { WireShadeServer } = require('wireshade');
-
-// 1. Setup your App
-const app = express();
-app.get('/', (req, res) => res.send('🎉 Hidden inside the VPN!'));
-
-// 2. Create standard HTTP server (not listening yet)
-const httpServer = http.createServer(app);
-
-// 3. Listen on the VPN
-const vpnServer = new WireShadeServer(client);
-vpnServer.on('connection', (socket) => {
-    httpServer.emit('connection', socket); // Feed VPN socket to HTTP server
-});
-
-await vpnServer.listen(80); // Listen on Port 80 of the VPN IP
-console.log('Server online at http://<VPN-IP>/');
-```
-
-**WebSocket Server:**
-```javascript
-const { WebSocketServer } = require('ws');
-const wss = new WebSocketServer({ noServer: true });
-
-httpServer.on('upgrade', (req, socket, head) => {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit('connection', ws, req);
-    });
-});
-```
-
-### 4. Port Forwarding
-WireShade supports both **Local Forwarding** (access VPN service locally) and **Remote Forwarding** (expose local service to VPN).
-
-**Local Forwarding (VPN -> Localhost):**
-Access a PostgreSQL database running at `10.0.0.5:5432` inside the VPN via `localhost:3333`.
-```javascript
-await client.forwardLocal(3333, '10.0.0.5', 5432);
-console.log('Connect to DB at localhost:3333');
-```
-
-**Remote Forwarding (Localhost -> VPN):**
-Expose your local development server (`localhost:3000`) to the VPN on port `8080`.
-```javascript
-// Listen on VPN Port 8080 -> Forward to localhost:3000
-await client.forwardRemote(8080, 'localhost', 3000);
-console.log('VPN users can access your dev server at http://<VPN-IP>:8080');
-```
+> **Trade-off — TCP over TCP:** the WebSocket transport tunnels WireGuard (and therefore your inner TCP) inside an outer TCP/TLS stream. It is excellent for firewall/proxy traversal and reliable, ordered links, but on lossy or high-jitter paths the two stacked congestion-control loops can fight ("TCP meltdown"). When the network is unreliable, the plain UDP transport generally behaves better; when you just need to get through, WebSocket wins.
 
 ---
 
-## ⚙️ Configuration & Features
+## 📖 Core API
 
-### Auto-Reconnection
-WireShade includes robust reconnection logic.
+```javascript
+const {
+    WireShade,          // = WireShadeClient, the high-level client (main export)
+    WireShadeWsServer,  // high-level WebSocket server peer
+    generateKeyPair,
+    generateSelfSignedCert,
+    parseConfig, readConfig,
+    ConnectionState
+} = require('wireshade');
+```
+
+**`new WireShade(configOrPath, [options])`**
+Create a client from a config object, or from a path to a `.conf` file (`new WireShade('wg.conf')`). `config.wireguard` takes the usual WireGuard fields: `privateKey`, `peerPublicKey`, `presharedKey`, `endpoint`, `sourceIp`, `listenPort`, `persistentKeepalive`. `persistentKeepalive` is in seconds (`PersistentKeepalive` in `.conf` files), defaults to `25`, and `0` disables it. Other options: `logging` (default `true`), `handshakeTimeout` (ms, default `10000`), `hosts`, `reconnect`, `transport`, and `onConnect`/`onDisconnect`/`onReconnect`.
+
+**`client.start()`** → `Promise<void>`
+Connects and resolves **once the real WireGuard handshake with the peer has completed** (rejects on timeout, DNS/bind error, or if `close()` is called first). When both peers are WireShade instances, start them concurrently: `Promise.all([a.start(), b.start()])`.
+
+**`client.close()`** → `Promise<void>`
+Stops reconnects and health checks, closes all servers/connections, and shuts down the native tunnel. Resolves once the native task has stopped. (`close()` is the high-level equivalent of the native `shutdown()`.)
+
+**Reconnection** — configure via the `reconnect` block; state changes surface as events:
 
 ```javascript
 const client = new WireShade({
-    wireguard: { ... },
+    wireguard: { /* ... */ },
     reconnect: {
-        enabled: true,
-        maxAttempts: 10,
-        delay: 1000,           // Start with 1s delay
-        backoffMultiplier: 1.5 // Exponential backoff
+        enabled: true,             // default true
+        maxAttempts: 10,           // 0 = unlimited
+        delay: 1000,               // initial backoff (ms)
+        maxDelay: 30000,           // backoff ceiling (ms)
+        backoffMultiplier: 1.5,    // exponential backoff factor
+        healthCheckInterval: 30000 // ms; 0 disables
     }
 });
 
-client.on('reconnecting', (attempt) => console.log(`🔄 Reconnecting... (${attempt})`));
+client.on('connect',     () => console.log('tunnel up'));
+client.on('disconnect',  (err) => console.log('tunnel down:', err?.message));
+client.on('reconnect',   () => console.log('tunnel restored'));
+client.on('stateChange', (state) => console.log('state:', state)); // see ConnectionState
 ```
 
-### Custom DNS / Hosts
-Map internal VPN hostnames to IPs without touching `/etc/hosts`.
+Tracked listeners (`listen`/`forwardRemote`) are automatically re-created on the new tunnel after a reconnect.
+
+**`client.ping(ip)`** → `Promise<number>` — ICMP echo; resolves with the round-trip time in ms.
+
+**`client.connect({ host, port })`** → `Duplex` — a `net.Socket`-compatible stream through the tunnel. Emits `'connect'`, `'data'`, `'end'`, `'error'`.
+
+**`client.listen(port, [onConnection])`** → `Promise<Server>` — a TCP server on the **VPN IP**; `onConnection` receives a socket per connection.
+
+**`client.forwardLocal(localPort, remoteHost, remotePort)`** → `Promise` — expose a VPN-side service on your local machine (`localhost:localPort` → `remoteHost:remotePort` inside the VPN).
+
+**`client.forwardRemote(vpnPort, targetHost, targetPort)`** → `Promise` — expose a local service to VPN peers (VPN IP `:vpnPort` → `targetHost:targetPort` on your machine).
 
 ```javascript
-const client = new WireShade({
-    wireguard: { ... },
-    hosts: {
-        'internal-api.local': '10.0.0.4',
-        'db-prod': '10.0.0.5'
-    }
-});
+await client.forwardLocal(3333, '10.0.0.5', 5432);   // reach VPN Postgres via localhost:3333
+await client.forwardRemote(8080, 'localhost', 3000); // publish local :3000 on the VPN at :8080
 ```
 
-## 📚 API Reference
+**`client.get(url, [opts])` / `client.request(url, [opts])`** → `Promise<string | object>` — HTTP(S) through the tunnel. Resolves with the body string (`opts.encoding`, default `utf8`); with `opts.fullResponse: true` resolves with `{ statusCode, statusMessage, headers, body, rawBody }`. `opts.body` sets a request body.
 
-**`new WireShade(config)`**
-- Creates a new VPN instance. `config` matches standard WireGuard parameters (`privateKey`, `endpoint`, etc.).
+**`client.getHttpAgent()` / `client.getHttpsAgent()`** — `http.Agent` / `https.Agent` routing through the tunnel (for `axios`, `node-fetch`, `ws`, …).
 
-**`client.start()`**
-- Connects to the VPN. Returns a `Promise` that resolves on connection.
+**`client.addHost(hostname, ip)`** — map a hostname to a VPN IP without touching `/etc/hosts`; the mapping is used for the client's own requests and forwards.
 
-**`client.get(url, [options])`**
-- Helper to make a simple HTTP GET request through the VPN. Returns connection body.
+**`generateKeyPair()`** → `{ privateKey, publicKey }` — a fresh WireGuard key pair.
 
-**`client.connect(options)`**
-- Creates a raw TCP socket (`net.Socket`) connected through the tunnel.
+**`parseConfig(text)` / `readConfig(path)`** — parse a WireGuard config from a string or file into a config object.
 
-**`client.listen(port, [callback])`**
-- Starts a TCP server listening on the **VPN IP** at the specified port.
+**`generateSelfSignedCert(sans)`** → `{ certPem, keyPem }` — a self-signed certificate + key (PEM) for the given subject alternative names, handy for `wss://` dev/test without OpenSSL.
 
-**`client.forwardLocal(localPort, remoteHost, remotePort)`**
-- Forwards a local port to a remote destination inside the VPN.
-
-**`client.forwardRemote(vpnPort, targetHost, targetPort)`**
-- Forwards a listener on the VPN IP to a target on your local machine.
-
-**`client.getHttpAgent() / client.getHttpsAgent()`**
-- Returns a Node.js `http.Agent` / `https.Agent` configured to route traffic through the tunnel.
-
-**`client.ping(ip)`**
-- Pings a remote host via ICMP and returns a `Promise` resolving to the round trip time in milliseconds.
+**`new WireShadeWsServer({ listen, pathPrefix, tls, wireguard, ... })`** — the WebSocket server peer. `listen` is `"host:port"`; provide `tls: { cert, key }` for `wss://` or omit it for `ws://`. Its `start()` resolves as soon as the socket is **bound and listening** (before any peer handshakes), so you can register `listen`/`forwardRemote` immediately. All other `WireShadeClient` methods and events apply.
 
 ---
+
+## 📊 Benchmarks
+
+WireShade ships two benchmark scripts. Numbers are machine-dependent, so run them yourself.
+
+```bash
+# Raw tunnel goodput + CPU-per-core on loopback (crypto/CPU cost, not RTT/loss):
+BENCH_TRANSPORT=udp BENCH_SECONDS=5 BENCH_CHUNK=262144 node bench/throughput.js
+#   BENCH_TRANSPORT = udp | ws | wss
+
+# Real iperf3 driven through the tunnel (needs iperf3 in PATH; skips cleanly if absent):
+BENCH_TRANSPORT=udp node bench/iperf3.js
+```
+
+`bench/throughput.js` measures the goodput and per-core CPU cost of the full path (WireGuard crypto + `smoltcp` + the NAPI boundary) on loopback — it isolates crypto/CPU throughput, not network latency or loss. `bench/iperf3.js` drives a real `iperf3` client/server pair through the tunnel for an industry-standard number, and auto-skips (exit 0) if `iperf3` is not installed.
+
+---
+
+## 📚 Examples
+
+Runnable scripts live in [`examples/`](examples/):
+
+| File | Shows |
+| :--- | :--- |
+| `01_quickstart.js` | Connect, request, and listen — the "hello world". |
+| `02_http_request.js` | Simple HTTP GET with `client.get()`. |
+| `03_https_custom_dns.js` | HTTPS with a custom hostname mapped to a VPN IP. |
+| `04_tcp_socket.js` | Raw TCP send/receive through the tunnel. |
+| `05_internet_routing.js` | Route public-internet traffic out via the VPN gateway. |
+| `06_simple_server.js` | Host a TCP/HTTP server inside the tunnel. |
+| `07_express_app.js` | Expose an Express app over the VPN (reverse tunnel). |
+| `08_local_forwarding.js` | `forwardLocal` — reach a VPN service on `localhost`. |
+| `09_reconnect_config.js` | Reconnection, health checks, and event monitoring. |
+| `10_remote_forwarding.js` | `forwardRemote` — publish a local service to the VPN. |
+| `11_websocket_wss.js` | WireGuard over WSS using the **native** binding. |
+| `13_websocket_highlevel.js` | WireGuard over WSS using the **high-level** API. |
+| `local_vpn.js` | Two local peers forming a P2P tunnel for testing. |
 
 ---
 
 ## 🎯 Use Cases
 
-*   **Microservices Communication:** Connect secure microservices across different clouds without exposing public ports.
-*   **Web Scraping:** Rotate IP addresses by creating multiple WireShade instances connected to different VPN endpoints.
-*   **Development Access:** Give developers access to private internal databases from their local machines securely.
-*   **IoT & Edge:** Connect edge devices behind restrictive NATs back to a central server using server mode.
+*   **Microservices:** connect services across clouds without exposing public ports.
+*   **Web scraping:** run multiple instances on different endpoints to rotate egress IPs.
+*   **Developer access:** reach private internal databases from a laptop, securely.
+*   **IoT & edge:** connect devices behind restrictive NATs back to a central server.
 
 ---
 
@@ -309,3 +316,5 @@ const client = new WireShade({
 MIT License.
 
 *WireGuard is a registered trademark of Jason A. Donenfeld.*
+</content>
+</invoke>
