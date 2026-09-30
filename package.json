@@ -59,6 +59,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/lkathke/WireShade.git"
+    "url": "git+https://github.com/lkathke/WireShade.git"
   }
 }
