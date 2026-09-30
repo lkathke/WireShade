@@ -31,13 +31,34 @@ export interface WsClientOptions {
   persistentKeepalive?: number | null
   /** Target URL, `ws://host:port` or `wss://host:port`. */
   url: string
-  /** Optional path appended to the URL (e.g. `v1` -> `/v1`). */
+  /**
+   * Optional path appended to the URL (e.g. `v1` -> `/v1`). In `wstunnel` mode
+   * this is the upgrade path prefix, used as `/<prefix>/events` (default `v1`).
+   */
   pathPrefix?: string | null
   /** Extra HTTP headers sent on the upgrade request. */
   headers?: Record<string, string> | null
   /** WebSocket ping keepalive interval in seconds (default 20). */
   keepaliveSec?: number | null
   tls?: WsClientTlsOptions | null
+  /**
+   * Wire protocol. `"native"` (default) uses WireShade's own framing (a plain
+   * WS upgrade). `"wstunnel"` speaks the wstunnel v2 upgrade
+   * (`GET /<pathPrefix>/events` with a `Sec-WebSocket-Protocol:
+   * v1, authorization.bearer.<JWT>` header), so the client can connect to a
+   * wstunnel-compatible server (`wireshade bridge` or a stock `wstunnel server`).
+   */
+  mode?: 'native' | 'wstunnel' | null
+  /**
+   * wstunnel mode only: the real WireGuard endpoint host the server should
+   * forward the UDP datagrams to (default `127.0.0.1`). Ignored in native mode.
+   */
+  remoteHost?: string | null
+  /**
+   * wstunnel mode only: the real WireGuard endpoint port (default `51820`).
+   * Ignored in native mode.
+   */
+  remotePort?: number | null
 }
 
 /** Server TLS options for {@link NativeWireShade.wsServer}. Providing it enables `wss`. */

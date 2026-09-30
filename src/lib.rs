@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod transport;
-use transport::{setup_transport, Transport, TransportConfig, WsClientConfig, WsServerConfig};
+use transport::{setup_transport, Transport, TransportConfig, WsClientConfig, WsClientMode, WsServerConfig};
 
 // --- Tunables ---
 
@@ -1377,6 +1377,11 @@ impl WireShade {
             options.persistent_keepalive,
         )?;
         let tls = options.tls.unwrap_or_default();
+        let mode = match options.mode.as_deref() {
+            Some("wstunnel") => WsClientMode::Wstunnel,
+            // `native` (default) or any other value keeps today's behavior.
+            _ => WsClientMode::Native,
+        };
         let cfg = WsClientConfig {
             url: options.url,
             path_prefix: options.path_prefix,
@@ -1384,6 +1389,9 @@ impl WireShade {
             keepalive_sec: options.keepalive_sec.filter(|&s| s > 0).unwrap_or(20),
             tls_ca: tls.ca,
             insecure_skip_verify: tls.insecure_skip_verify.unwrap_or(false),
+            mode,
+            remote_host: options.remote_host,
+            remote_port: options.remote_port,
         };
         Ok(Self::spawn(tunn, source_ip_addr, TransportConfig::WsClient(cfg)))
     }
@@ -1593,13 +1601,24 @@ pub struct WsClientOptions {
     pub persistent_keepalive: Option<u16>,
     /// Target URL, `ws://host:port` or `wss://host:port`.
     pub url: String,
-    /// Optional path appended to the URL (e.g. `v1` -> `/v1`).
+    /// Optional path appended to the URL (e.g. `v1` -> `/v1`). In `wstunnel`
+    /// mode this is the upgrade path prefix (`/<prefix>/events`, default `v1`).
     pub path_prefix: Option<String>,
     /// Extra HTTP headers sent on the upgrade request (disguise / auth).
     pub headers: Option<HashMap<String, String>>,
     /// WebSocket ping keepalive interval in seconds (default 20).
     pub keepalive_sec: Option<u32>,
     pub tls: Option<WsClientTlsOptions>,
+    /// Wire protocol: `"native"` (default, WireShade's own framing) or
+    /// `"wstunnel"` (wstunnel v2 compatible upgrade so a WireShade client can
+    /// reach a wstunnel-style server / the `wireshade bridge`).
+    pub mode: Option<String>,
+    /// wstunnel mode only: real WireGuard endpoint host the server forwards to
+    /// (default `127.0.0.1`). Ignored in native mode.
+    pub remote_host: Option<String>,
+    /// wstunnel mode only: real WireGuard endpoint port (default `51820`).
+    /// Ignored in native mode.
+    pub remote_port: Option<u16>,
 }
 
 /// Server TLS options for `wsServer`. Providing this enables `wss`.

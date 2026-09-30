@@ -10,12 +10,18 @@
 //! * [`WsClientTransport`] — one WebSocket binary frame = one packet.
 //! * [`WsServerTransport`] — accepts a single WS client at a time, 1:1 peer model.
 
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
@@ -65,6 +71,16 @@ pub enum TransportConfig {
     WsServer(WsServerConfig),
 }
 
+/// Wire-protocol mode of the WebSocket client transport.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WsClientMode {
+    /// WireShade's own framing: plain WS upgrade, one binary frame per packet.
+    Native,
+    /// wstunnel v2 compatible upgrade (`/<prefix>/events` + a bearer-JWT
+    /// subprotocol) so a WireShade client can talk to a wstunnel-style server.
+    Wstunnel,
+}
+
 /// Resolved options for the WebSocket client transport.
 pub struct WsClientConfig {
     pub url: String,
@@ -73,6 +89,12 @@ pub struct WsClientConfig {
     pub keepalive_sec: u32,
     pub tls_ca: Option<String>,
     pub insecure_skip_verify: bool,
+    /// Wire protocol: `Native` (default) keeps today's behavior; `Wstunnel`
+    /// speaks the wstunnel v2 upgrade.
+    pub mode: WsClientMode,
+    /// wstunnel mode only: the real UDP endpoint the server should forward to.
+    pub remote_host: Option<String>,
+    pub remote_port: Option<u16>,
 }
 
 /// Resolved options for the WebSocket server transport.
@@ -307,13 +329,16 @@ pub struct WsClientTransport {
 
 impl WsClientTransport {
     pub async fn connect(cfg: WsClientConfig) -> Result<Self, String> {
-        let mut url = cfg.url.trim_end_matches('/').to_string();
-        if let Some(prefix) = &cfg.path_prefix {
-            let prefix = prefix.trim_matches('/');
-            if !prefix.is_empty() {
-                url = format!("{}/{}", url, prefix);
-            }
-        }
+        let base = cfg.url.trim_end_matches('/').to_string();
+        let prefix = cfg.path_prefix.as_deref().map(|p| p.trim_matches('/')).filter(|p| !p.is_empty());
+        let url = match cfg.mode {
+            WsClientMode::Native => match prefix {
+                Some(prefix) => format!("{}/{}", base, prefix),
+                None => base,
+            },
+            // wstunnel v2: GET /<prefix>/events (prefix defaults to `v1`).
+            WsClientMode::Wstunnel => format!("{}/{}/events", base, prefix.unwrap_or("v1")),
+        };
         let secure = url.starts_with("wss://");
 
         let mut request = url
@@ -326,6 +351,17 @@ impl WsClientTransport {
                 let value = HeaderValue::from_str(v).map_err(|e| format!("Invalid header value for '{}': {}", k, e))?;
                 request.headers_mut().insert(name, value);
             }
+        }
+
+        // wstunnel handshake: advertise the `v1` subprotocol and carry the tunnel
+        // target inside a bearer JWT, exactly as a stock `wstunnel client` does.
+        if cfg.mode == WsClientMode::Wstunnel {
+            let remote_host = cfg.remote_host.as_deref().unwrap_or("127.0.0.1");
+            let remote_port = cfg.remote_port.unwrap_or(51820);
+            let jwt = make_wstunnel_jwt(remote_host, remote_port)?;
+            let proto = format!("v1, authorization.bearer.{}", jwt);
+            let value = HeaderValue::from_str(&proto).map_err(|e| format!("Invalid subprotocol header: {}", e))?;
+            request.headers_mut().insert(HeaderName::from_static("sec-websocket-protocol"), value);
         }
 
         let connector = if secure {
@@ -362,6 +398,53 @@ impl WsClientTransport {
             },
         })
     }
+}
+
+// --- wstunnel JWT (HS256) ---
+
+/// Secret used to sign the wstunnel bearer JWT. wstunnel servers decode the
+/// token WITHOUT verifying the signature (`insecure_decode`), so the exact
+/// secret is irrelevant to interop; any fixed value works.
+const WSTUNNEL_JWT_SECRET: &[u8] = b"wireshade";
+
+/// Build the wstunnel v2 bearer JWT (HS256) carrying the UDP tunnel target.
+/// Claims: `{ "id": "<uuid v4>", "p": {"Udp":{"timeout":null}}, "r": "<host>", "rp": <port> }`.
+fn make_wstunnel_jwt(remote_host: &str, remote_port: u16) -> Result<String, String> {
+    let header = br#"{"alg":"HS256","typ":"JWT"}"#;
+    let claims = format!(
+        r#"{{"id":"{}","p":{{"Udp":{{"timeout":null}}}},"r":"{}","rp":{}}}"#,
+        random_uuid_v4(),
+        json_escape(remote_host),
+        remote_port
+    );
+    let signing_input = format!("{}.{}", URL_SAFE_NO_PAD.encode(header), URL_SAFE_NO_PAD.encode(claims.as_bytes()));
+    let mut mac = Hmac::<Sha256>::new_from_slice(WSTUNNEL_JWT_SECRET).map_err(|e| format!("JWT HMAC init failed: {}", e))?;
+    mac.update(signing_input.as_bytes());
+    let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{}.{}", signing_input, sig))
+}
+
+/// Minimal JSON string escaping for values embedded in the claims (host names
+/// never normally contain these, but stay well-formed regardless).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// A random UUID v4 string. Randomness comes from `RandomState` (same source as
+/// the engine's `random_u64`); the id only needs to be unique-ish per tunnel.
+fn random_uuid_v4() -> String {
+    let a = RandomState::new().build_hasher().finish();
+    let b = RandomState::new().build_hasher().finish();
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&a.to_le_bytes());
+    bytes[8..].copy_from_slice(&b.to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
 }
 
 #[async_trait::async_trait]
