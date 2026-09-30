@@ -473,6 +473,147 @@ await client.start();
 console.log(await client.get('http://10.0.0.1/'));
 ```
 
+### 🍳 Autres recettes
+
+Six autres schémas éprouvés sur le terrain — même style autonome, numérotés à la suite des dix précédents.
+
+### 11. Réutiliser un client BD / Redis existant, sans modification
+
+Transférez le port distant vers `localhost`, puis pointez votre pilote existant dessus — la bibliothèque elle-même ne nécessite aucune modification.
+
+```javascript
+const { WireShade } = require('wireshade');
+const { Client } = require('pg');            // your existing DB driver — untouched
+
+const wg = new WireShade('wg.conf');
+await wg.start();
+
+// localhost:5432 → 10.0.0.5:5432 inside the VPN.
+await wg.forwardLocal(5432, '10.0.0.5', 5432);
+
+// Point the *unmodified* pg / ioredis client at the local end of the forward:
+const db = new Client({ host: 'localhost', port: 5432, user: 'app', database: 'prod' });
+await db.connect();
+// const redis = new Redis({ host: 'localhost', port: 6379 });  // ioredis — same idea
+```
+
+### 12. Se connecter en SSH à un hôte du VPN via un port transféré
+
+Exposez le port SSH d'un pair sur `localhost` et connectez-vous avec un client `ssh` standard.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const wg = new WireShade('wg.conf');
+await wg.start();
+
+// localhost:2222 → 10.0.0.9:22 inside the VPN.
+await wg.forwardLocal(2222, '10.0.0.9', 22);
+console.log('tunnel ready — now: ssh -p 2222 user@localhost');
+```
+
+```bash
+ssh -p 2222 user@localhost
+```
+
+### 13. VPN pair-à-pair entre deux pairs — sans serveur central
+
+Deux pairs WireShade forment un tunnel direct : l'un écoute, l'autre se connecte.
+
+```javascript
+const { WireShade, generateKeyPair } = require('wireshade');
+
+const a = generateKeyPair();
+const b = generateKeyPair();
+
+// Two peers, no central server: A listens on a UDP port, B dials into it.
+const peerA = new WireShade({
+    wireguard: {
+        privateKey: a.privateKey, peerPublicKey: b.publicKey,
+        endpoint: '127.0.0.1:51821', sourceIp: '10.0.0.1', listenPort: 51820
+    }
+});
+const peerB = new WireShade({
+    wireguard: {
+        privateKey: b.privateKey, peerPublicKey: a.publicKey,
+        endpoint: '127.0.0.1:51820', sourceIp: '10.0.0.2', listenPort: 51821
+    }
+});
+
+// start() resolves only after a real handshake, so bring both up together.
+await Promise.all([peerA.start(), peerB.start()]);
+
+await peerA.listen(9000, (socket) => socket.end('hello from A'));
+const socket = peerB.connect({ host: '10.0.0.1', port: 9000 });
+socket.on('data', (d) => console.log('B received:', d.toString()));
+```
+
+### 14. Survivre aux coupures avec reconnexion automatique, événements et contrôles de santé
+
+Activez la reconnexion avec backoff et suivez le cycle de vie du tunnel via les événements.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+const client = new WireShade('wg.conf', {
+    reconnect: {
+        enabled: true,             // auto-reconnect when the tunnel drops
+        maxAttempts: 0,            // 0 = retry forever
+        delay: 1000,               // first retry after 1 s
+        maxDelay: 30000,           // cap the backoff at 30 s
+        backoffMultiplier: 2,      // double the delay each attempt
+        healthCheckInterval: 60000 // probe the tunnel every 60 s
+    }
+});
+
+client.on('stateChange', (state) => console.log('state:', state));
+client.on('disconnect', (err) => console.warn('tunnel down:', err?.message));
+client.on('reconnect', () => console.log('tunnel restored'));
+
+await client.start();
+```
+
+### 15. Exécuter en CI / serverless / conteneurs — sans root
+
+Aucun périphérique TUN ni privilège requis, le tunnel fonctionne donc là où un VPN noyau ne le peut pas.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+// Self-contained handler — no TUN device, no root, no admin rights.
+// Runs as-is in AWS Lambda, GitHub Actions, or an unprivileged container.
+exports.handler = async () => {
+    const client = new WireShade('wg.conf');
+    await client.start();
+    try {
+        return await client.get('https://10.0.0.1/api/health');
+    } finally {
+        await client.close();
+    }
+};
+```
+
+### 16. `ws://` en clair derrière un proxy inverse qui termine TLS
+
+Laissez nginx/Caddy gérer le TLS et gardez le côté WireShade en clair.
+
+```javascript
+const { WireShade } = require('wireshade');
+
+// nginx / Caddy terminates TLS at the edge and proxies to a plaintext ws://
+// backend, so the client speaks ws:// and WireShade handles no certificates.
+const client = new WireShade({
+    wireguard: { privateKey: '<client private key>', peerPublicKey: '<server public key>', sourceIp: '10.0.0.2' },
+    transport: {
+        type: 'websocket',
+        url: 'ws://vpn.example.com',   // the proxy upgrades this to the WS server
+        pathPrefix: 'wg'               // e.g. proxy route /wg → the WireShade WS server
+    }
+});
+await client.start();
+console.log(await client.get('http://10.0.0.1/'));
+```
+
 ---
 
 ## 📚 Exemples
