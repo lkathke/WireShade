@@ -19,6 +19,11 @@ function parseArgs(argv) {
         if (!a.startsWith('-')) { (opts._ = opts._ || []).push(a); continue; }
         a = a.replace(/^--?/, '');
         if (alias[a]) a = alias[a];
+        if (a === 'L' || a === 'R') { // repeatable port-forward specs
+            const nv = argv[i + 1];
+            if (nv !== undefined && !nv.startsWith('-')) { (opts[a] = opts[a] || []).push(nv); i++; }
+            continue;
+        }
         if (a === 'verbose' || a === 'help' || a === 'insecure'
             || a === 'set-system-proxy' || a === 'dry-run-proxy') { opts[a] = true; continue; }
         const next = argv[i + 1];
@@ -37,6 +42,7 @@ const USAGE = `wireshade - userspace WireGuard tunnel & SOCKS5 proxy
 
 Usage:
   wireshade socks   [options]     Connect and expose a local SOCKS5 proxy
+  wireshade forward [options]     Connect and forward ports (-L / -R, like ssh)
   wireshade unset-proxy           Restore system proxy settings (crash recovery)
   wireshade genkey                Print a new WireGuard key pair
   wireshade version               Print version
@@ -68,6 +74,11 @@ socks options:
       --chrome-path <file>       browser executable (else auto-detected)
   -v, --verbose                  log each proxied connection
 
+forward options (same connection flags as socks: -c/-t/--url/--ca/...):
+  -L <localPort:remoteHost:remotePort>   forward a local port into the VPN (ssh -L)
+  -R <vpnPort:targetHost:targetPort>     publish a local service into the VPN (ssh -R)
+  (both flags are repeatable)
+
 Notes:
   Reaching the public internet (not just the VPN range) requires the WireGuard
   server to be an exit node (IP forwarding + NAT). WireShade forwards any host;
@@ -79,6 +90,8 @@ Examples:
   wireshade socks -c wg0.conf -t wss --url wss://vpn.example.com:443 --ca server.pem
   wireshade socks -c wg0.conf --chrome https://example.internal
   wireshade socks -c wg0.conf --set-system-proxy
+  wireshade forward -c wg0.conf -L 8080:10.0.0.5:80
+  wireshade forward -c wg0.conf -R 2222:127.0.0.1:22 -L 5432:10.0.0.9:5432
 `;
 
 function parseListen(v) {
@@ -200,6 +213,47 @@ async function cmdSocks(o) {
     }
 }
 
+function parseForward(spec) {
+    const parts = String(spec).split(':');
+    if (parts.length !== 3) die(`invalid forward spec "${spec}" (expected port:host:port)`);
+    return [parseInt(parts[0], 10), parts[1], parseInt(parts[2], 10)];
+}
+
+async function cmdForward(o) {
+    const Ls = [].concat(o.L || []);
+    const Rs = [].concat(o.R || []);
+    if (!Ls.length && !Rs.length) die('forward needs at least one -L or -R spec');
+
+    const config = buildConfig(o);
+    const client = new WireShadeClient(config);
+    const label = config.transport ? `${config.transport.type} (${config.transport.url})`
+                                    : `udp (${config.wireguard.endpoint})`;
+    process.stderr.write(`wireshade: connecting via ${label} ...\n`);
+    await client.start();
+    process.stderr.write(`wireshade: tunnel up (source ${config.wireguard.sourceIp})\n`);
+
+    for (const spec of Ls) {
+        const [lp, rh, rp] = parseForward(spec);          // localPort:remoteHost:remotePort
+        await client.forwardLocal(lp, rh, rp);
+        process.stderr.write(`wireshade: -L localhost:${lp} -> ${rh}:${rp} (through tunnel)\n`);
+    }
+    for (const spec of Rs) {
+        const [vp, th, tp] = parseForward(spec);          // vpnPort:targetHost:targetPort
+        await client.forwardRemote(vp, th, tp);
+        process.stderr.write(`wireshade: -R vpn:${vp} -> ${th}:${tp} (local)\n`);
+    }
+
+    let closing = false;
+    const shutdown = () => {
+        if (closing) return;
+        closing = true;
+        process.stderr.write('\nwireshade: shutting down ...\n');
+        Promise.resolve(client.close()).finally(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+}
+
 async function cmdUnsetProxy(o) {
     const { unsetSystemProxy } = require('../lib/system_proxy');
     const ok = unsetSystemProxy({ dryRun: !!o['dry-run-proxy'], log: (m) => process.stderr.write('wireshade: ' + m + '\n') });
@@ -215,6 +269,9 @@ async function main() {
     switch (cmd) {
         case 'socks':
             await cmdSocks(o);
+            break;
+        case 'forward':
+            await cmdForward(o);
             break;
         case 'unset-proxy':
             await cmdUnsetProxy(o);
