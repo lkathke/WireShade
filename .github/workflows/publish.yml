@@ -89,17 +89,20 @@ jobs:
           path: wireshade.*.node
           if-no-files-found: error
 
+      # Non-blocking: a pkg hiccup must never fail the build/npm publish.
       - name: Build standalone CLI executable
         if: ${{ matrix.settings.pkg }}
+        continue-on-error: true
         run: npx pkg bin/wireshade.js --targets ${{ matrix.settings.pkg }} --output dist/${{ matrix.settings.exe }} --public
 
       - name: Upload CLI executable
         if: ${{ matrix.settings.pkg }}
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.settings.target }}
           path: dist/${{ matrix.settings.exe }}
-          if-no-files-found: error
+          if-no-files-found: warn
 
   release:
     name: Release CLI executables
