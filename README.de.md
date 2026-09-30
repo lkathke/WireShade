@@ -1,6 +1,6 @@
 # 👻 WireShade mit Node.js
 
-**Die ultimative Userspace-WireGuard®-Implementierung für Node.js**
+**Userspace-WireGuard® für Node.js — eine Bibliothek *und* eine SSH-artige CLI (SOCKS5, Port-Weiterleitung, `ssh`), die über UDP oder WebSocket läuft, ohne Root oder TUN-Gerät.**
 
 [![npm version](https://img.shields.io/npm/v/wireshade.svg)](https://www.npmjs.com/package/wireshade)
 [![npm downloads](https://img.shields.io/npm/dm/wireshade.svg)](https://www.npmjs.com/package/wireshade)
@@ -294,11 +294,37 @@ npx wireshade socks -c wg0.conf
 
 | Befehl | Beschreibung |
 | :--- | :--- |
+| `wireshade ssh [options] [user@]host [-- cmd]` | Per SSH über den Tunnel zu einem Host verbinden |
 | `wireshade socks [options]` | Verbinden und einen lokalen SOCKS5-Proxy bereitstellen |
+| `wireshade forward [options]` | Verbinden und Ports weiterleiten (`-L` / `-R`, wie `ssh`) |
 | `wireshade unset-proxy` | System-Proxy-Einstellungen wiederherstellen (Absturz-Wiederherstellung) |
 | `wireshade genkey` | Ein neues WireGuard-Schlüsselpaar ausgeben |
 | `wireshade version` | Die Version ausgeben |
 | `wireshade help` | Hilfe anzeigen |
+
+### Häufige Beispiele
+
+```bash
+# SSH to a host inside the VPN (WireGuard over UDP or WebSocket)
+wireshade ssh -c wg0.conf admin@10.0.0.9
+
+# ...over WebSocket, running a one-off remote command
+wireshade ssh -c wg0.conf -t wss --url wss://vpn.example.com:443 admin@10.0.0.9 -- uptime
+
+# SOCKS5 proxy, launch Chrome through it (WireGuard over WebSocket/WSS)
+wireshade socks -c wg0.conf -t wss --url wss://vpn.example.com:443 --chrome https://example.internal
+
+# SOCKS5 proxy for the whole system (restored on exit)
+wireshade socks -c wg0.conf --set-system-proxy
+
+# Forward a local port into the VPN (like ssh -L)
+wireshade forward -c wg0.conf -L 8080:10.0.0.5:80
+
+# Reverse forward + a DB port, both directions at once (like ssh -R / -L)
+wireshade forward -c wg0.conf -R 2222:127.0.0.1:22 -L 5432:10.0.0.9:5432
+```
+
+`wireshade ssh` leitet einen ephemeren lokalen Port über den Tunnel an den Port `:22` des Hosts weiter und führt darauf dein System-`ssh` aus. Nutze `--port` für einen abweichenden SSH-Port und `-- <args>`, um einen Remote-Befehl oder zusätzliche `ssh`-Argumente zu übergeben. Der System-`ssh`-Client muss installiert sein.
 
 ### `socks`-Optionen
 
@@ -324,6 +350,15 @@ npx wireshade socks -c wg0.conf
 | `--chrome [url]` | Chrome/Edge/Chromium über diesen Proxy in einem isolierten Profil starten; das Schließen des Browsers beendet wireshade |
 | `--chrome-path <file>` | Browser-Programmdatei (sonst automatisch erkannt; berücksichtigt auch `$CHROME_PATH`) |
 | `-v, --verbose` | Jede weitergeleitete Verbindung protokollieren |
+
+### `forward`-Optionen
+
+Nutzt die **gleichen Verbindungs-Flags wie `socks`** (`-c` / `-t` / `--url` / `--ca` / …). Beide Port-Weiterleitungs-Flags sind wiederholbar.
+
+| Option | Beschreibung |
+| :--- | :--- |
+| `-L <localPort:remoteHost:remotePort>` | Einen lokalen Port ins VPN weiterleiten (wie `ssh -L`) |
+| `-R <vpnPort:targetHost:targetPort>` | Einen lokalen Dienst im VPN bereitstellen (wie `ssh -R`) |
 
 ### Beispiele
 

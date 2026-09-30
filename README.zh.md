@@ -1,6 +1,6 @@
 # 👻 WireShade Node.js 版
 
-**Node.js 终极用户态 WireGuard® 实现**
+**Node.js 用户态 WireGuard® —— 一个库*以及*一个 SSH 风格的命令行工具（SOCKS5、端口转发、`ssh`），运行在 UDP 或 WebSocket 之上，无需 root 或 TUN 设备。**
 
 [![npm version](https://img.shields.io/npm/v/wireshade.svg)](https://www.npmjs.com/package/wireshade)
 [![npm downloads](https://img.shields.io/npm/dm/wireshade.svg)](https://www.npmjs.com/package/wireshade)
@@ -294,11 +294,37 @@ npx wireshade socks -c wg0.conf
 
 | 命令 | 说明 |
 | :--- | :--- |
+| `wireshade ssh [options] [user@]host [-- cmd]` | 通过隧道 SSH 连接到主机 |
 | `wireshade socks [options]` | 连接并暴露一个本地 SOCKS5 代理 |
+| `wireshade forward [options]` | 连接并转发端口（`-L` / `-R`，类似 `ssh`） |
 | `wireshade unset-proxy` | 恢复系统代理设置（崩溃恢复） |
 | `wireshade genkey` | 打印一个新的 WireGuard 密钥对 |
 | `wireshade version` | 打印版本号 |
 | `wireshade help` | 显示用法 |
+
+### 常用示例
+
+```bash
+# SSH to a host inside the VPN (WireGuard over UDP or WebSocket)
+wireshade ssh -c wg0.conf admin@10.0.0.9
+
+# ...over WebSocket, running a one-off remote command
+wireshade ssh -c wg0.conf -t wss --url wss://vpn.example.com:443 admin@10.0.0.9 -- uptime
+
+# SOCKS5 proxy, launch Chrome through it (WireGuard over WebSocket/WSS)
+wireshade socks -c wg0.conf -t wss --url wss://vpn.example.com:443 --chrome https://example.internal
+
+# SOCKS5 proxy for the whole system (restored on exit)
+wireshade socks -c wg0.conf --set-system-proxy
+
+# Forward a local port into the VPN (like ssh -L)
+wireshade forward -c wg0.conf -L 8080:10.0.0.5:80
+
+# Reverse forward + a DB port, both directions at once (like ssh -R / -L)
+wireshade forward -c wg0.conf -R 2222:127.0.0.1:22 -L 5432:10.0.0.9:5432
+```
+
+`wireshade ssh` 会通过隧道将一个临时本地端口转发到主机的 `:22`，然后对其运行你系统的 `ssh`。使用 `--port` 指定非标准 SSH 端口，使用 `-- <args>` 传递远程命令或额外的 `ssh` 参数。它依赖系统已安装 `ssh` 客户端。
 
 ### `socks` 选项
 
@@ -324,6 +350,15 @@ npx wireshade socks -c wg0.conf
 | `--chrome [url]` | 通过此代理在隔离的配置文件中启动 Chrome/Edge/Chromium；关闭浏览器会停止 wireshade |
 | `--chrome-path <file>` | 浏览器可执行文件（否则自动检测；也遵循 `$CHROME_PATH`） |
 | `-v, --verbose` | 记录每个被代理的连接 |
+
+### `forward` 选项
+
+使用与 `socks` **相同的连接标志**（`-c` / `-t` / `--url` / `--ca` / …）。两个端口转发标志均可重复使用。
+
+| 选项 | 说明 |
+| :--- | :--- |
+| `-L <localPort:remoteHost:remotePort>` | 将本地端口转发进 VPN（类似 `ssh -L`） |
+| `-R <vpnPort:targetHost:targetPort>` | 将本地服务发布到 VPN 中（类似 `ssh -R`） |
 
 ### 示例
 
