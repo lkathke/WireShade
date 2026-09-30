@@ -438,12 +438,78 @@ struct Engine {
     udp_buf: Vec<u8>,
     /// Output buffer for boringtun (encapsulate / decapsulate / timers).
     wg_buf: Vec<u8>,
+
+    /// Cheap instrumentation (Stage A), printed only when `WIRESHADE_STATS` set.
+    stats: Stats,
 }
 
 /// Result of handling a command.
 enum Flow {
     Continue,
     Shutdown(Option<oneshot::Sender<()>>),
+}
+
+/// Cheap engine instrumentation (Stage A). Counters are always incremented
+/// (plain u64 adds); a per-second summary is printed to stderr only when the
+/// `WIRESHADE_STATS` env var is set, so there is no cost on the hot path in
+/// production. Used to characterize where the UDP path idles.
+#[derive(Default)]
+struct Stats {
+    enabled: bool,
+    last: Option<std::time::Instant>,
+    loop_iters: u64,
+    woke_cmd: u64,
+    woke_recv: u64,
+    woke_timer: u64,
+    woke_sleep: u64,
+    rx_datagrams: u64,
+    rx_drained: u64,
+    tx_packets: u64,
+    send_calls: u64,
+    flush_calls: u64,
+    flush_nonempty: u64,
+    ingress_pkts: u64,
+    egress_pkts: u64,
+    cmds: u64,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("WIRESHADE_STATS").is_some(),
+            ..Default::default()
+        }
+    }
+
+    fn maybe_report(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let last = *self.last.get_or_insert(now);
+        let dt = now.duration_since(last).as_secs_f64();
+        if dt < 1.0 {
+            return;
+        }
+        let per = |n: u64| (n as f64 / dt) as u64;
+        let avg_flush = if self.flush_nonempty > 0 {
+            self.tx_packets as f64 / self.flush_nonempty as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[STATS] iters/s={} | wake: cmd={} recv={} timer={} sleep={} | rx_dgram/s={} (drained/s={}) \
+             | tx_pkt/s={} send/s={} flush(nonempty)/s={} avg_tx_batch={:.1} | ingress/s={} egress/s={} cmds/s={}",
+            per(self.loop_iters),
+            per(self.woke_cmd), per(self.woke_recv), per(self.woke_timer), per(self.woke_sleep),
+            per(self.rx_datagrams), per(self.rx_drained),
+            per(self.tx_packets), per(self.send_calls), per(self.flush_nonempty), avg_flush,
+            per(self.ingress_pkts), per(self.egress_pkts), per(self.cmds),
+        );
+        // Reset the window.
+        let enabled = self.enabled;
+        *self = Stats { enabled, last: Some(now), ..Default::default() };
+    }
 }
 
 impl Engine {
@@ -491,6 +557,7 @@ impl Engine {
             next_local_port,
             udp_buf: vec![0; 65535],
             wg_buf: vec![0; 65535],
+            stats: Stats::new(),
         })
     }
 
@@ -506,6 +573,8 @@ impl Engine {
 
         let mut next_timer = tokio::time::Instant::now() + TIMER_INTERVAL;
         loop {
+            self.stats.loop_iters += 1;
+            self.stats.maybe_report();
             self.poll_iface();
             self.process_listeners();
             self.process_connections();
@@ -516,6 +585,7 @@ impl Engine {
 
             let now = tokio::time::Instant::now();
             if now >= next_timer {
+                self.stats.woke_timer += 1;
                 self.on_timer().await;
                 next_timer = now + TIMER_INTERVAL;
                 continue;
@@ -531,13 +601,15 @@ impl Engine {
                 cmd = cmd_rx.recv() => match cmd {
                     None => Flow::Shutdown(None),
                     Some(cmd) => {
+                        self.stats.woke_cmd += 1;
+                        self.stats.cmds += 1;
                         let mut flow = self.handle_command(cmd);
                         for _ in 1..MAX_COMMANDS_PER_ITER {
                             if !matches!(flow, Flow::Continue) {
                                 break;
                             }
                             match cmd_rx.try_recv() {
-                                Ok(cmd) => flow = self.handle_command(cmd),
+                                Ok(cmd) => { self.stats.cmds += 1; flow = self.handle_command(cmd); }
                                 Err(_) => break,
                             }
                         }
@@ -545,14 +617,16 @@ impl Engine {
                     }
                 },
                 res = self.transport.recv(&mut self.udp_buf) => {
+                    self.stats.woke_recv += 1;
                     match res {
                         Ok(len) => {
+                            self.stats.rx_datagrams += 1;
                             self.handle_datagram(len).await;
                             // Drain any further datagrams that are already available,
                             // so a burst is processed in one poll cycle (as UDP did).
                             for _ in 1..MAX_DATAGRAMS_PER_ITER {
                                 match self.transport.try_recv(&mut self.udp_buf) {
-                                    Ok(len) => self.handle_datagram(len).await,
+                                    Ok(len) => { self.stats.rx_datagrams += 1; self.stats.rx_drained += 1; self.handle_datagram(len).await; }
                                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                     Err(e) => debug!("[WG] transport recv error: {}", e),
                                 }
@@ -563,7 +637,7 @@ impl Engine {
                     }
                     Flow::Continue
                 },
-                _ = tokio::time::sleep_until(wake_at) => Flow::Continue,
+                _ = tokio::time::sleep_until(wake_at) => { self.stats.woke_sleep += 1; Flow::Continue },
             };
 
             if let Flow::Shutdown(resp) = flow {
@@ -617,9 +691,14 @@ impl Engine {
 
     /// Encrypt and send everything smoltcp has emitted.
     async fn flush_tx(&mut self) {
+        self.stats.flush_calls += 1;
+        let mut sent = false;
         while let Some(packet) = self.device.tx_queue.pop_front() {
             match self.tunn.encapsulate(&packet, &mut self.wg_buf) {
                 TunnResult::WriteToNetwork(b) => {
+                    self.stats.tx_packets += 1;
+                    self.stats.send_calls += 1;
+                    sent = true;
                     if let Err(e) = self.transport.send(b).await {
                         debug!("[WG] transport send failed: {}", e);
                     }
@@ -628,6 +707,9 @@ impl Engine {
                 _ => {}
             }
             self.device.recycle(packet);
+        }
+        if sent {
+            self.stats.flush_nonempty += 1;
         }
     }
 
@@ -696,8 +778,9 @@ impl Engine {
         for _ in 0..MAX_INGRESS_PACKETS {
             match self.iface.poll_ingress_single(smol_now(), &mut self.device, &mut self.sockets) {
                 PollIngressSingleResult::None => break,
-                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::PacketProcessed => { self.stats.ingress_pkts += 1; }
                 PollIngressSingleResult::SocketStateChanged => {
+                    self.stats.ingress_pkts += 1;
                     if want_backlog {
                         self.ensure_listen_backlog();
                     }
@@ -708,7 +791,9 @@ impl Engine {
         for _ in 0..MAX_EGRESS_ROUNDS {
             let before = self.device.tx_queue.len();
             let res = self.iface.poll_egress(smol_now(), &mut self.device, &mut self.sockets);
-            if self.device.tx_queue.len() == before && matches!(res, PollResult::None) {
+            let after = self.device.tx_queue.len();
+            self.stats.egress_pkts += (after.saturating_sub(before)) as u64;
+            if after == before && matches!(res, PollResult::None) {
                 break;
             }
         }

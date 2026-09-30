@@ -101,6 +101,40 @@ pub struct UdpTransport {
     udp: UdpSocket,
 }
 
+/// Default UDP socket send/receive buffer target, in bytes. A userspace
+/// WireGuard tunnel bursts many datagrams per scheduler wakeup; with the OS
+/// default (often 64-256 KiB) a burst overflows the kernel socket buffer, drops
+/// WireGuard packets, and forces smoltcp into a retransmit stall. Enlarging
+/// SO_RCVBUF/SO_SNDBUF lets a full in-flight window survive a burst, which is
+/// the dominant lever for loopback/LAN goodput. Best-effort: the OS may clamp
+/// the request (e.g. Linux `net.core.rmem_max`). Override with `WIRESHADE_UDP_BUF`.
+const UDP_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
+fn udp_socket_buffer() -> usize {
+    std::env::var("WIRESHADE_UDP_BUF").ok().and_then(|v| v.parse().ok()).unwrap_or(UDP_SOCKET_BUFFER)
+}
+
+/// Bind a UDP socket with enlarged send/receive buffers (best-effort) and return
+/// it as a tokio socket. The buffer sizing itself never fails the bind (the OS is
+/// free to reject or clamp the request); only the bind/convert can error, exactly
+/// as a plain tokio bind would.
+async fn bind_udp_with_buffers(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    let want = udp_socket_buffer();
+    // Best-effort: ignore errors, the OS may reject or clamp the size.
+    let _ = sock.set_recv_buffer_size(want);
+    let _ = sock.set_send_buffer_size(want);
+    sock.set_nonblocking(true)?;
+    sock.bind(&bind_addr.into())?;
+    if let (Ok(rcv), Ok(snd)) = (sock.recv_buffer_size(), sock.send_buffer_size()) {
+        debug!("[WG] UDP socket buffers: SO_RCVBUF={} SO_SNDBUF={} (requested {})", rcv, snd, want);
+    }
+    UdpSocket::from_std(sock.into())
+}
+
 impl UdpTransport {
     /// Resolve the endpoint and create a connected UDP socket.
     pub async fn connect(endpoint: &str, listen_port: Option<u16>) -> Result<Self, String> {
@@ -122,7 +156,7 @@ impl UdpTransport {
         } else {
             SocketAddr::from(([0u16; 8], port))
         };
-        let udp = UdpSocket::bind(bind_addr)
+        let udp = bind_udp_with_buffers(bind_addr)
             .await
             .map_err(|e| format!("Failed to bind UDP socket on {}: {}", bind_addr, e))?;
         udp.connect(endpoint_addr)

@@ -13,6 +13,9 @@ napi = { version = "2.12", features = ["tokio_rt", "async"] }
 napi-derive = { version = "2.12", default-features = false, features = ["compat-mode", "strict"] }
 # Core networking
 tokio = { version = "1", features = ["full"] }
+# Low-level socket option access (SO_RCVBUF / SO_SNDBUF on the UDP transport).
+# Already in the tree transitively via tokio; pinned here as a direct dep.
+socket2 = "0.6"
 # The userspace TCP/IP stack
 smoltcp = { version = "0.12", features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-icmp", "async"] }
 # WireGuard implementation (Cloudflare)
