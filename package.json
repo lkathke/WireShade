@@ -19,6 +19,12 @@
     "README.md",
     "LICENSE"
   ],
+  "pkg": {
+    "assets": [
+      "wireshade.*.node"
+    ],
+    "outputPath": "dist"
+  },
   "napi": {
     "binaryName": "wireshade",
     "targets": [
@@ -55,6 +61,7 @@
   "description": "Userspace WireGuard for Node.js — a library and an SSH-style CLI: SOCKS5 proxy, TCP/HTTP tunneling, port forwarding and ssh, over UDP or WebSocket (WSS), with no root or TUN device.",
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",
+    "@yao-pkg/pkg": "^6.23.0",
     "express": "^5.2.1"
   },
   "repository": {
