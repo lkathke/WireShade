@@ -64,7 +64,10 @@ socks options:
 
   -t, --transport <udp|ws|wss>   carrier transport (default: udp)
       --url <ws[s]://host:port>  WS server URL (required for ws/wss)
-      --path-prefix <p>          WS upgrade path prefix
+      --mode <native|wstunnel>   WS handshake; wstunnel = connect through a
+                                 wireshade bridge / stock wstunnel server to
+                                 the real WG server given by --endpoint
+      --path-prefix <p>          WS upgrade path prefix (wstunnel: /<p>/events)
       --ca <file>                pin a PEM certificate (wss, self-signed)
       --insecure                 skip TLS verification (test only)
 
@@ -152,6 +155,7 @@ function buildConfig(o) {
             type: 'websocket',
             url: o.url,
             pathPrefix: o['path-prefix'],
+            mode: (o.mode && o.mode !== true) ? String(o.mode).toLowerCase() : undefined,
             tls: Object.keys(tls).length ? tls : undefined
         };
     } else if (transport !== 'udp') {
